@@ -17,7 +17,7 @@ Container images built from source or thinly extended from vendor images, publis
 
 ## Layout and conventions
 
-One directory per image: `apps/<name>/Dockerfile`. Every Dockerfile declares its upstream at the top, and Renovate updates both lines together:
+One directory per image: `apps/<name>/Dockerfile` and an executable `apps/<name>/test.sh` (the PR smoke test). Every Dockerfile sets an `org.opencontainers.image.description` label, which becomes the package description, and declares its upstream at the top. Renovate updates both upstream lines together:
 
 ```dockerfile
 # renovate: datasource=<docker|github-tags> depName=<image or owner/repo>
