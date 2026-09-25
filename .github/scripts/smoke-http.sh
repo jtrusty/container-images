@@ -23,7 +23,7 @@ for _ in $(seq 1 30); do
   code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/" || true)
   if [[ "$code" != "000" ]]; then
     # Read the uid from the host: distroless images have no `id` binary.
-    uid=$(docker top "$name" -o uid | awk 'NR==2 {print $1}')
+    uid=$(ps -o uid= -p "$(docker inspect -f '{{.State.Pid}}' "$name")" | tr -d ' ')
     if [[ "$uid" == 0 || "$uid" == root ]]; then
       echo "the image's default user is root; it must run non-root"; exit 1
     fi
