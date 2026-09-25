@@ -34,6 +34,7 @@ RUN v="${VERSION##*/}" \
     uv sync --frozen --no-dev --no-editable --package unifi-network-mcp
 
 FROM docker.io/library/python:3.14.7-slim@sha256:caaf356f40667c496d405780745b9ac25771c189a51dfcc42430d531ea09f8a2
+LABEL org.opencontainers.image.description="UniFi Network MCP server, built from source"
 WORKDIR /app
 COPY --from=build /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:${PATH}" \

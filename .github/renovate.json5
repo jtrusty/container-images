@@ -27,5 +27,14 @@
       additionalBranchPrefix: "{{parentDir}}-",
       commitMessagePrefix: "{{parentDir}}:",
     },
+    {
+      // Tools downloaded with a pinned *_SHA256 in the Dockerfile. Renovate can
+      // bump the version but not the checksum, so these PRs need a manual step.
+      matchDepNames: ["cli/cli", "sheeki03/tirith", "kubernetes/kubernetes"],
+      addLabels: ["checksum-update"],
+      prBodyNotes: [
+        "**Manual step:** update the matching `*_SHA256` build argument in the Dockerfile to the new release's published checksum. The build fails until it matches.",
+      ],
+    },
   ],
 }

@@ -21,6 +21,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     -o /out/truenas-mcp ./cmd/truenas-mcp
 
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+LABEL org.opencontainers.image.description="TrueNAS MCP server, built from source"
 LABEL io.modelcontextprotocol.server.name="io.github.cedricziel/truenas-mcp"
 COPY --from=build /out/truenas-mcp /usr/local/bin/truenas-mcp
 USER nonroot:nonroot
