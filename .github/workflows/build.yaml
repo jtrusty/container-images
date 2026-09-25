@@ -3,12 +3,18 @@ name: build
 # No schedule: every base image and upstream is pinned, so a timed rebuild
 # changes nothing but the digest. scan.yaml says when a rebuild is needed.
 on:
+  # Every PR runs (no path filter) so the required `build-ok` check always
+  # reports; the changes job decides what, if anything, to build.
   pull_request:
-    paths: ["apps/**", ".github/workflows/build.yaml", ".github/scripts/**"]
   push:
     branches: [main]
     paths: ["apps/**", ".github/workflows/build.yaml", ".github/scripts/**"]
   workflow_dispatch:
+    inputs:
+      app:
+        description: Image to rebuild (a directory under apps/), or "all"
+        required: true
+        default: all
 
 permissions:
   contents: read
@@ -34,11 +40,17 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          ONLY: ${{ inputs.app }}
         run: |
           set -euo pipefail
           all=$(find apps -mindepth 2 -maxdepth 2 -name Dockerfile -printf '%h\n' | cut -d/ -f2 | sort -u)
-          # A new branch, a dispatch, or the workflow/scripts changing means build everything.
-          if [[ "$EVENT" == workflow_dispatch || -z "$BASE" || "$BASE" =~ ^0+$ ]] \
+          if [[ "$EVENT" == workflow_dispatch && -n "$ONLY" && "$ONLY" != all ]]; then
+            grep -Fxq -- "$ONLY" <<<"$all" || { echo "no image named '$ONLY'"; exit 1; }
+            apps="$ONLY"
+          # A dispatch, a new branch, a base we can't see (force-push), or the
+          # workflow/scripts changing means build everything.
+          elif [[ "$EVENT" == workflow_dispatch || -z "$BASE" || "$BASE" =~ ^0+$ ]] \
+             || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null \
              || git diff --name-only "$BASE" HEAD | grep -qE '^\.github/(workflows/build\.yaml|scripts/)'; then
             apps="$all"
           else
@@ -78,6 +90,20 @@ jobs:
           set -euo pipefail
           test -x "apps/$APP/test.sh" || { echo "apps/$APP/test.sh is required"; exit 1; }
           "apps/$APP/test.sh" "smoke/$APP:pr"
+
+  # The one check the main ruleset requires: matrix job names vary with the
+  # images a PR touches, so gate on this instead.
+  build-ok:
+    if: always() && github.event_name == 'pull_request'
+    needs: [changes, build]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          CHANGES: ${{ needs.changes.result }}
+          BUILD: ${{ needs.build.result }}
+        run: |
+          echo "changes=$CHANGES build=$BUILD"
+          [[ "$CHANGES" == success && ( "$BUILD" == success || "$BUILD" == skipped ) ]]
 
   # main and dispatch: build, push, sign and verify. The only job that can
   # write packages.
@@ -145,7 +171,18 @@ jobs:
           sbom: true
           cache-from: type=gha,scope=${{ matrix.app }}
           cache-to: type=gha,scope=${{ matrix.app }},mode=max
+      # Test the exact pushed digest before signing it: an untested image may
+      # exist in the registry for a moment, but it is never signed.
+      - name: Smoke test the pushed image
+        env:
+          APP: ${{ matrix.app }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: '"apps/$APP/test.sh" "${IMAGE}@${DIGEST}"'
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          # Signatures are cosign 3 bundles; verifiers need cosign 3+.
+          cosign-release: v3.1.3
       - name: Sign and verify
         env:
           IMAGE: ${{ steps.meta.outputs.image }}

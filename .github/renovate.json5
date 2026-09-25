@@ -28,6 +28,13 @@
       commitMessagePrefix: "{{parentDir}}:",
     },
     {
+      // The runner's managed Python stays on 3.10 (what the consuming projects
+      // require); only patch releases are proposed.
+      matchDepNames: ["python"],
+      matchDatasources: ["python-version"],
+      allowedVersions: "<3.11",
+    },
+    {
       // Tools downloaded with a pinned *_SHA256 in the Dockerfile. Renovate can
       // bump the version but not the checksum, so these PRs need a manual step.
       matchDepNames: ["cli/cli", "sheeki03/tirith", "kubernetes/kubernetes"],
