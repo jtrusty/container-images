@@ -1,0 +1,31 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: ["config:recommended", "helpers:pinGitHubActionDigests"],
+  dependencyDashboard: true,
+  customManagers: [
+    {
+      // The upstream of every image: a renovate comment, then VERSION and DIGEST.
+      customType: "regex",
+      managerFilePatterns: ["/(^|/)Dockerfile$/"],
+      matchStrings: [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: versioning=(?<versioning>\\S+))?\\nARG VERSION=(?<currentValue>\\S+)\\nARG DIGEST=(?<currentDigest>\\S+)",
+      ],
+    },
+    {
+      // Tool versions used during a build (e.g. Playwright's dependency installer).
+      customType: "regex",
+      managerFilePatterns: ["/(^|/)Dockerfile$/"],
+      matchStrings: [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\nARG [A-Z_]+_VERSION=(?<currentValue>\\S+)\\n",
+      ],
+    },
+  ],
+  packageRules: [
+    {
+      // One PR per image, titled by its directory, so each upstream change is reviewed on its own.
+      matchFileNames: ["apps/**"],
+      additionalBranchPrefix: "{{parentDir}}-",
+      commitMessagePrefix: "{{parentDir}}:",
+    },
+  ],
+}

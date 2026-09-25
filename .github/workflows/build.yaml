@@ -1,0 +1,120 @@
+name: build
+
+on:
+  pull_request:
+    paths: ["apps/**", ".github/workflows/build.yaml"]
+  push:
+    branches: [main]
+    paths: ["apps/**", ".github/workflows/build.yaml"]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# PR runs share a group so a new push cancels the superseded one. Runs on main
+# get their own group: GitHub keeps only one pending run per group, so a
+# shared group would silently cancel the publish of back-to-back merges.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.apps.outputs.apps }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: apps
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          all=$(find apps -mindepth 2 -maxdepth 2 -name Dockerfile -printf '%h\n' | cut -d/ -f2 | sort -u)
+          # A new branch or the workflow itself changing means build everything.
+          if [[ "$EVENT" == schedule || "$EVENT" == workflow_dispatch || -z "$BASE" || "$BASE" =~ ^0+$ ]] \
+             || git diff --name-only "$BASE" HEAD | grep -qx '.github/workflows/build.yaml'; then
+            apps="$all"
+          else
+            apps=$(git diff --name-only "$BASE" HEAD | sed -n 's|^apps/\([^/]*\)/.*|\1|p' | sort -u | grep -Fxf <(echo "$all") || true)
+          fi
+          echo "apps=$(jq -cn --arg a "$apps" '$a | split("\n") | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
+
+  # PR builds: prove the image builds. No push, read-only token.
+  build:
+    if: github.event_name == 'pull_request' && needs.changes.outputs.apps != '[]'
+    needs: changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.changes.outputs.apps) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: apps/${{ matrix.app }}
+          push: false
+          cache-from: type=gha,scope=${{ matrix.app }}
+
+  # main, weekly, dispatch: build, push and sign. The only job that can write packages.
+  publish:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.changes.outputs.apps != '[]'
+    needs: changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.changes.outputs.apps) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: meta
+        env:
+          APP: ${{ matrix.app }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^ARG VERSION=//p' "apps/$APP/Dockerfile" | head -1)
+          [[ -n "$version" ]] || { echo "apps/$APP/Dockerfile has no ARG VERSION"; exit 1; }
+          # Monorepo tags look like network/v1.2.3: drop the path, then the v.
+          tag=${version##*/}; tag=${tag#v}
+          echo "tag=ghcr.io/${GITHUB_REPOSITORY_OWNER}/${APP}:${tag}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: apps/${{ matrix.app }}
+          push: true
+          tags: ${{ steps.meta.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,scope=${{ matrix.app }},mode=max
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - env:
+          IMAGE: ${{ steps.meta.outputs.tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes "${IMAGE%:*}@${DIGEST}"
+          echo "### ${IMAGE}" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${IMAGE%:*}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
