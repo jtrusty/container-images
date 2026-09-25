@@ -7,7 +7,7 @@
 ARG VERSION=v0.4.2
 ARG DIGEST=cd66fba8b6b3547c8cf202a225bdafd416cc631d
 
-FROM docker.io/library/golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS build
+FROM docker.io/library/golang:1.27.1-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS build
 ARG VERSION
 ARG DIGEST
 ARG TARGETOS
