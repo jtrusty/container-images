@@ -17,6 +17,7 @@ RUN npm ci \
  && npm prune --omit=dev
 
 FROM docker.io/library/node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402
+LABEL org.opencontainers.image.description="authentik MCP server, built from source"
 ENV NODE_ENV=production \
     MCP_PORT=3000 \
     MCP_HOST=0.0.0.0

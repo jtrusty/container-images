@@ -1,0 +1,64 @@
+name: scan
+
+# Weekly vulnerability scan of every published image, at the digest its
+# current tag points to. Findings go to the repository's code scanning
+# alerts; a fixable high/critical finding is the signal to bump the image.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.apps.outputs.apps }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: apps
+        run: |
+          set -euo pipefail
+          echo "apps=$(find apps -mindepth 2 -maxdepth 2 -name Dockerfile -printf '%h\n' | cut -d/ -f2 | sort -u | jq -Rcs 'split("\n") | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
+
+  scan:
+    needs: images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.images.outputs.apps) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - id: ref
+        env:
+          APP: ${{ matrix.app }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^ARG VERSION=//p' "apps/$APP/Dockerfile" | head -1)
+          tag=${version##*/}; tag=${tag#v}
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/${APP}"
+          digest=$(docker buildx imagetools inspect "${image}:${tag}" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "ref=${image}@${digest}" >> "$GITHUB_OUTPUT"
+      - id: grype
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: ${{ steps.ref.outputs.ref }}
+          fail-build: false
+          only-fixed: true
+          severity-cutoff: high
+          output-format: sarif
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: ${{ steps.grype.outputs.sarif }}
+          category: ${{ matrix.app }}

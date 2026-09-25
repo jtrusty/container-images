@@ -13,6 +13,7 @@ ARG VERSION=v2026.9.24
 ARG DIGEST=sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
 
 FROM docker.io/nousresearch/hermes-agent:${VERSION}@${DIGEST}
+LABEL org.opencontainers.image.description="hermes-agent with the GitHub CLI and tirith preinstalled"
 
 # renovate: datasource=github-releases depName=cli/cli
 ARG GH_VERSION=2.101.0

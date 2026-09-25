@@ -1,13 +1,13 @@
 name: build
 
+# No schedule: every base image and upstream is pinned, so a timed rebuild
+# changes nothing but the digest. scan.yaml says when a rebuild is needed.
 on:
   pull_request:
-    paths: ["apps/**", ".github/workflows/build.yaml"]
+    paths: ["apps/**", ".github/workflows/build.yaml", ".github/scripts/**"]
   push:
     branches: [main]
-    paths: ["apps/**", ".github/workflows/build.yaml"]
-  schedule:
-    - cron: "17 6 * * 1"
+    paths: ["apps/**", ".github/workflows/build.yaml", ".github/scripts/**"]
   workflow_dispatch:
 
 permissions:
@@ -29,6 +29,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: apps
         env:
           EVENT: ${{ github.event_name }}
@@ -36,16 +37,17 @@ jobs:
         run: |
           set -euo pipefail
           all=$(find apps -mindepth 2 -maxdepth 2 -name Dockerfile -printf '%h\n' | cut -d/ -f2 | sort -u)
-          # A new branch or the workflow itself changing means build everything.
-          if [[ "$EVENT" == schedule || "$EVENT" == workflow_dispatch || -z "$BASE" || "$BASE" =~ ^0+$ ]] \
-             || git diff --name-only "$BASE" HEAD | grep -qx '.github/workflows/build.yaml'; then
+          # A new branch, a dispatch, or the workflow/scripts changing means build everything.
+          if [[ "$EVENT" == workflow_dispatch || -z "$BASE" || "$BASE" =~ ^0+$ ]] \
+             || git diff --name-only "$BASE" HEAD | grep -qE '^\.github/(workflows/build\.yaml|scripts/)'; then
             apps="$all"
           else
             apps=$(git diff --name-only "$BASE" HEAD | sed -n 's|^apps/\([^/]*\)/.*|\1|p' | sort -u | grep -Fxf <(echo "$all") || true)
           fi
           echo "apps=$(jq -cn --arg a "$apps" '$a | split("\n") | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
 
-  # PR builds: prove the image builds. No push, read-only token.
+  # PR builds: build, then smoke-test the image the way it will run. No push,
+  # read-only token.
   build:
     if: github.event_name == 'pull_request' && needs.changes.outputs.apps != '[]'
     needs: changes
@@ -59,14 +61,26 @@ jobs:
         app: ${{ fromJSON(needs.changes.outputs.apps) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: apps/${{ matrix.app }}
           push: false
+          load: true
+          tags: smoke/${{ matrix.app }}:pr
           cache-from: type=gha,scope=${{ matrix.app }}
+      - name: Smoke test
+        env:
+          APP: ${{ matrix.app }}
+        run: |
+          set -euo pipefail
+          test -x "apps/$APP/test.sh" || { echo "apps/$APP/test.sh is required"; exit 1; }
+          "apps/$APP/test.sh" "smoke/$APP:pr"
 
-  # main, weekly, dispatch: build, push and sign. The only job that can write packages.
+  # main and dispatch: build, push, sign and verify. The only job that can
+  # write packages.
   publish:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.changes.outputs.apps != '[]'
     needs: changes
@@ -81,16 +95,25 @@ jobs:
         app: ${{ fromJSON(needs.changes.outputs.apps) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - id: meta
         env:
           APP: ${{ matrix.app }}
         run: |
           set -euo pipefail
-          version=$(sed -n 's/^ARG VERSION=//p' "apps/$APP/Dockerfile" | head -1)
-          [[ -n "$version" ]] || { echo "apps/$APP/Dockerfile has no ARG VERSION"; exit 1; }
+          file="apps/$APP/Dockerfile"
+          version=$(sed -n 's/^ARG VERSION=//p' "$file" | head -1)
+          [[ -n "$version" ]] || { echo "$file has no ARG VERSION"; exit 1; }
+          description=$(sed -n 's/^LABEL org.opencontainers.image.description="\(.*\)"$/\1/p' "$file" | head -1)
+          [[ -n "$description" ]] || { echo "$file has no org.opencontainers.image.description label"; exit 1; }
           # Monorepo tags look like network/v1.2.3: drop the path, then the v.
           tag=${version##*/}; tag=${tag#v}
-          echo "tag=ghcr.io/${GITHUB_REPOSITORY_OWNER}/${APP}:${tag}" >> "$GITHUB_OUTPUT"
+          {
+            echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER}/${APP}"
+            echo "tag=${tag}"
+            echo "description=${description}"
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -102,19 +125,40 @@ jobs:
         with:
           context: apps/${{ matrix.app }}
           push: true
-          tags: ${{ steps.meta.outputs.tag }}
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
           labels: |
+            org.opencontainers.image.title=${{ matrix.app }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.tag }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}/tree/main/apps/${{ matrix.app }}
             org.opencontainers.image.revision=${{ github.sha }}
+          # GHCR reads the package description and links from the index,
+          # which is what we publish (provenance + SBOM make it an index).
+          annotations: |
+            index:org.opencontainers.image.title=${{ matrix.app }}
+            index:org.opencontainers.image.description=${{ steps.meta.outputs.description }}
+            index:org.opencontainers.image.version=${{ steps.meta.outputs.tag }}
+            index:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            index:org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}/tree/main/apps/${{ matrix.app }}
+            index:org.opencontainers.image.revision=${{ github.sha }}
           provenance: mode=max
           sbom: true
           cache-from: type=gha,scope=${{ matrix.app }}
           cache-to: type=gha,scope=${{ matrix.app }},mode=max
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - env:
-          IMAGE: ${{ steps.meta.outputs.tag }}
+      - name: Sign and verify
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAG: ${{ steps.meta.outputs.tag }}
           DIGEST: ${{ steps.build.outputs.digest }}
+          IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/build.yaml@refs/heads/main
         run: |
-          cosign sign --yes "${IMAGE%:*}@${DIGEST}"
-          echo "### ${IMAGE}" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`${IMAGE%:*}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          cosign verify "${IMAGE}@${DIGEST}" \
+            --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null
+          {
+            echo "### ${IMAGE}:${TAG}"
+            echo "\`${IMAGE}@${DIGEST}\` (signed and verified)"
+          } >> "$GITHUB_STEP_SUMMARY"

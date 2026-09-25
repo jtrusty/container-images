@@ -17,7 +17,7 @@ Container images built from source or thinly extended from vendor images, publis
 
 ## Layout and conventions
 
-One directory per image: `apps/<name>/Dockerfile`. Every Dockerfile declares its upstream at the top, and Renovate updates both lines together:
+One directory per image: `apps/<name>/Dockerfile` and an executable `apps/<name>/test.sh` (the PR smoke test). Every Dockerfile sets an `org.opencontainers.image.description` label, which becomes the package description, and declares its upstream at the top. Renovate updates both upstream lines together:
 
 ```dockerfile
 # renovate: datasource=<docker|github-tags> depName=<image or owner/repo>
@@ -32,10 +32,15 @@ ARG DIGEST=<sha256:… for docker, commit SHA for github-tags>
 
 `.github/workflows/build.yaml`:
 
-- **Pull requests:** build the changed images only, with `packages: read`. Nothing is pushed.
-- **`main`:** build the changed images, push `ghcr.io/jtrusty/<name>:<version>`, and sign the digest with cosign (keyless). Only this job holds `packages: write`.
-- **Weekly and on dispatch:** rebuild everything, to pick up base-image security updates.
-- Every action is pinned to a commit SHA.
+- **Pull requests:** build the changed images with `packages: read` (nothing is pushed), then run each image's `apps/<name>/test.sh` smoke test against the local build. Servers are started non-root with a read-only root filesystem and must answer on their port; tool images must run their tools.
+- **`main` and dispatch:** build the changed images, push `ghcr.io/jtrusty/<name>:<version>` with OCI labels and index annotations, then sign the digest with cosign (keyless) and verify the signature. Only this job holds `packages: write`.
+- **No scheduled rebuild.** Everything is pinned, so a timed rebuild would only change the digest.
+
+`.github/workflows/scan.yaml` scans every published image weekly with grype (fixable high and critical only) and reports to code scanning. A finding there is the signal to bump an image.
+
+`.github/workflows/lint.yaml` runs [zizmor](https://github.com/zizmorcore/zizmor) on the workflows. Every action is pinned to a commit SHA, and every checkout sets `persist-credentials: false`.
+
+Tools downloaded with a pinned checksum (`gh`, `tirith`, `kubectl`) get a `checksum-update` label on their Renovate PRs: update the `*_SHA256` argument by hand.
 
 Verify a published image:
 

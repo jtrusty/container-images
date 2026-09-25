@@ -20,6 +20,7 @@ FROM docker.io/library/golang:1.25.14-bookworm@sha256:3b4a11519ad929d1e1d261a12c
 FROM ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 AS uv
 
 FROM ghcr.io/actions/actions-runner:${VERSION}@${DIGEST}
+LABEL org.opencontainers.image.description="Actions Runner Controller runner with Node, uv/Python, Go, kubectl and Playwright's Chromium libraries"
 
 # renovate: datasource=npm depName=playwright
 ARG PLAYWRIGHT_VERSION=1.63.0
