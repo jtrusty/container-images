@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.26.0@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
 # Actions Runner Controller runner image. The upstream image is minimal; this
 # adds a CI toolchain so jobs don't download it on every run:
 # - Node 24 with npm, and corepack enabled (pnpm/yarn shims, a pinned pnpm
