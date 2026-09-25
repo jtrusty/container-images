@@ -7,8 +7,8 @@ Container images built from source or thinly extended from vendor images, publis
 | `actions-runner` | Actions Runner Controller runner with a CI toolchain: Node 24, uv + Python 3.10, Go, kubectl, Playwright's Chromium system libraries | `FROM ghcr.io/actions/actions-runner` |
 | `hermes-agent` | hermes-agent with the GitHub CLI and tirith preinstalled | `FROM docker.io/nousresearch/hermes-agent` |
 | `mcp-authentik` | authentik MCP server | source, `Samik081/mcp-authentik` |
-| `truenas-mcp` | TrueNAS MCP server | source, `cedricziel/truenas-mcp` |
-| `unifi-network-mcp` | UniFi Network MCP server | source, `sirkirby/unifi-network-mcp` |
+| `mcp-truenas` | TrueNAS MCP server | source, `cedricziel/truenas-mcp` |
+| `mcp-unifi` | UniFi Network MCP server | source, `sirkirby/unifi-network-mcp` |
 
 ## Why
 
