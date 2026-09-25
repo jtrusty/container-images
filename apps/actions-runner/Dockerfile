@@ -78,7 +78,7 @@ USER runner
 # Pre-download pnpm into the runner user's corepack cache, so a project that
 # pins this version in `packageManager` starts without a download.
 # renovate: datasource=npm depName=pnpm
-ARG PNPM_VERSION=10.34.5
+ARG PNPM_VERSION=12.6.0
 RUN corepack install --global "pnpm@${PNPM_VERSION}" && pnpm --version
 # Everything must work for the unprivileged runner user, not just root.
 RUN node --version && go version && git --version && kubectl version --client \
