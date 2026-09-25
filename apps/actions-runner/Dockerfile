@@ -1,8 +1,8 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.26.0@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 # Actions Runner Controller runner image. The upstream image is minimal; this
 # adds a CI toolchain so jobs don't download it on every run:
 # - Node 24 (with npm and corepack), for JavaScript/TypeScript jobs
-# - uv, with a managed CPython 3.10 preinstalled
+# - uv, with a managed CPython 3.10 (exact patch pinned) preinstalled
 # - Go
 # - kubectl, checksum-verified
 # - the system libraries Playwright's Chromium needs, so browser tests can
@@ -27,7 +27,9 @@ ARG PLAYWRIGHT_VERSION=1.63.0
 # renovate: datasource=github-releases depName=kubernetes/kubernetes
 ARG KUBECTL_VERSION=v1.37.1
 ARG KUBECTL_SHA256=65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8
-ARG UV_PYTHON=3.10
+# Exact patch, so a rebuild can't silently change the interpreter.
+# renovate: datasource=python-version depName=python
+ARG PYTHON_VERSION=3.10.21
 
 USER root
 
@@ -49,7 +51,7 @@ ENV PATH=/usr/local/go/bin:${PATH}
 # finds it without a download.
 COPY --from=uv /uv /uvx /usr/local/bin/
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
-RUN uv python install "${UV_PYTHON}" \
+RUN uv python install "${PYTHON_VERSION}" \
  && chmod -R a+rX /opt/uv \
  && uv python list --only-installed
 
@@ -66,4 +68,4 @@ RUN npm_config_cache=/tmp/npm npx --yes "playwright@${PLAYWRIGHT_VERSION}" insta
 USER runner
 # Everything must work for the unprivileged runner user, not just root.
 RUN node --version && go version && git --version && kubectl version --client \
- && uv python find "${UV_PYTHON}"
+ && uv python find "${PYTHON_VERSION}"

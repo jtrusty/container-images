@@ -23,7 +23,7 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(("0.0.0.0", 8000), H).serve_forever()
 ' >/dev/null
 
-"$(dirname "$0")/../../.github/scripts/smoke-http.sh" "$image" 3000 --user 1000:1000 --network "$net" \
+"$(dirname "$0")/../../.github/scripts/smoke-http.sh" "$image" 3000 --network "$net" \
   -e MCP_TRANSPORT=http -e MCP_PORT=3000 -e MCP_HOST=0.0.0.0 \
   -e AUTHENTIK_URL="http://${stub}:8000" -e AUTHENTIK_TOKEN=placeholder \
   -e AUTHENTIK_ACCESS_TIER=read-only

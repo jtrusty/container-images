@@ -42,10 +42,25 @@ ARG DIGEST=<sha256:… for docker, commit SHA for github-tags>
 
 Tools downloaded with a pinned checksum (`gh`, `tirith`, `kubectl`) get a `checksum-update` label on their Renovate PRs: update the `*_SHA256` argument by hand.
 
-Verify a published image:
+Verify a published image (signatures are cosign 3 bundles, so this needs **cosign 3+**):
 
 ```sh
 cosign verify ghcr.io/jtrusty/<name>@sha256:<digest> \
-  --certificate-identity-regexp '^https://github.com/jtrusty/container-images/.github/workflows/build.yaml@refs/heads/main$' \
+  --certificate-identity 'https://github.com/jtrusty/container-images/.github/workflows/build.yaml@refs/heads/main' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
+
+## Rules
+
+- **`main` is protected:** changes land through a PR, and the `build-ok` check (every changed image built and smoke-tested) must pass. The publish job smoke-tests the pushed digest again before signing it.
+- **Never clean up untagged image versions.** Re-publishing a tag leaves the previous digest untagged, and consumers deploy by digest, so an old digest may still be in use.
+
+## Runbooks
+
+**Rebuild one image** (for example after a scan finding in a base image's system packages): run the `build` workflow manually with `app` set to the image's directory name. It builds, tests, publishes and signs only that image. Consumers pick up the new digest the next time they re-pin.
+
+**Add an image:**
+
+1. Create `apps/<name>/Dockerfile`. Start with the pinned `# syntax=` line and the renovate/`VERSION`/`DIGEST` header, and set `LABEL org.opencontainers.image.description`. The final stage runs as a non-root user.
+2. Create an executable `apps/<name>/test.sh` taking the image reference as `$1`. For a server, call `.github/scripts/smoke-http.sh` (any HTTP answer counts, it runs the image's own user, and root fails). For a tool image, run the tools.
+3. Add a row to the table above, then open a PR.

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Start an image the way it is meant to run (non-root, read-only root
-# filesystem, only /tmp writable) and require that its HTTP port answers.
+# Start an image the way it is meant to run (as the image's own user, which
+# must not be root; read-only root filesystem; only /tmp writable) and require
+# that its HTTP port answers.
 # Any HTTP status counts: this proves the process starts and listens, not
 # that it can reach a real backend.
 #
@@ -21,7 +22,12 @@ for _ in $(seq 1 30); do
   fi
   code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/" || true)
   if [[ "$code" != "000" ]]; then
-    echo "ok: port ${port} answered HTTP ${code} as uid $(docker exec "$name" id -u 2>/dev/null || echo '?')"
+    # Read the uid from the host: distroless images have no `id` binary.
+    uid=$(docker top "$name" -o uid | awk 'NR==2 {print $1}')
+    if [[ "$uid" == 0 || "$uid" == root ]]; then
+      echo "the image's default user is root; it must run non-root"; exit 1
+    fi
+    echo "ok: port ${port} answered HTTP ${code}, running as uid ${uid}"
     exit 0
   fi
   sleep 1
