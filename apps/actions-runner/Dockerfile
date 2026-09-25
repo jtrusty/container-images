@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1.26.0@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 # Actions Runner Controller runner image. The upstream image is minimal; this
 # adds a CI toolchain so jobs don't download it on every run:
-# - Node 24 (with npm and corepack), for JavaScript/TypeScript jobs
+# - Node 24 with npm, and corepack enabled (pnpm/yarn shims, a pinned pnpm
+#   pre-downloaded), for JavaScript/TypeScript jobs
 # - uv, with a managed CPython 3.10 (exact patch pinned) preinstalled
 # - Go
 # - kubectl, checksum-verified
@@ -34,13 +35,18 @@ ARG PYTHON_VERSION=3.10.21
 USER root
 
 # Node: the binary and its bundled npm/corepack, not the rest of the node image.
+# `corepack enable` runs here because its pnpm/yarn shims go in root-owned
+# /usr/local/bin; a job running it as the runner user can't write there.
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=node /usr/local/include/node /usr/local/include/node
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
  && ln -s ../lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack \
- && node --version && npm --version
+ && node --version && npm --version \
+ && corepack enable
+# Jobs never stop for corepack's "download this package manager?" prompt.
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 
 # Go toolchain. GOTOOLCHAIN=auto (the default) still fetches a newer toolchain
 # if a go.mod asks for one.
@@ -61,11 +67,19 @@ RUN curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERS
  && chmod 0755 /usr/local/bin/kubectl \
  && kubectl version --client
 
-# Playwright's Chromium system libraries, installed with the Node above.
+# Playwright's Chromium system libraries, installed with the Node above, plus
+# libatomic, which prebuilt Node-ecosystem binaries (e.g. pnpm's standalone
+# build) link against.
 RUN npm_config_cache=/tmp/npm npx --yes "playwright@${PLAYWRIGHT_VERSION}" install-deps chromium \
+ && apt-get install -y --no-install-recommends libatomic1 \
  && rm -rf /var/lib/apt/lists/* /tmp/npm
 
 USER runner
+# Pre-download pnpm into the runner user's corepack cache, so a project that
+# pins this version in `packageManager` starts without a download.
+# renovate: datasource=npm depName=pnpm
+ARG PNPM_VERSION=10.34.5
+RUN corepack install --global "pnpm@${PNPM_VERSION}" && pnpm --version
 # Everything must work for the unprivileged runner user, not just root.
 RUN node --version && go version && git --version && kubectl version --client \
  && uv python find "${PYTHON_VERSION}"
