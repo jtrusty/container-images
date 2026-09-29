@@ -1,0 +1,7 @@
+{
+  "name": "supergateway-pinned",
+  "private": true,
+  "dependencies": {
+    "supergateway": "3.4.3"
+  }
+}
