@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.26.0@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
+# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # Actions Runner Controller runner image. The upstream image is minimal; this
 # adds a CI toolchain so jobs don't download it on every run:
 # - Node 24 with npm, and corepack enabled (pnpm/yarn shims, a pinned pnpm
@@ -78,7 +78,7 @@ USER runner
 # Pre-download pnpm into the runner user's corepack cache, so a project that
 # pins this version in `packageManager` starts without a download.
 # renovate: datasource=npm depName=pnpm
-ARG PNPM_VERSION=10.34.5
+ARG PNPM_VERSION=12.8.1
 RUN corepack install --global "pnpm@${PNPM_VERSION}" && pnpm --version
 # Everything must work for the unprivileged runner user, not just root.
 RUN node --version && go version && git --version && kubectl version --client \
