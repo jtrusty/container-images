@@ -104,17 +104,22 @@ class Launcher:
 
     # --- Kubernetes --------------------------------------------------------
     def kube_get(self, path):
-        base = os.environ.get("KUBE_API_URL")
-        headers, ctx = {}, None
-        if not base:
-            sa = "/var/run/secrets/kubernetes.io/serviceaccount"
-            base = f"https://{os.environ['KUBERNETES_SERVICE_HOST']}:{os.environ['KUBERNETES_SERVICE_PORT']}"
-            headers["Authorization"] = "Bearer " + open(f"{sa}/token").read().strip()
-            ctx = ssl.create_default_context(cafile=f"{sa}/ca.crt")
         try:
+            base = os.environ.get("KUBE_API_URL")
+            headers, ctx = {}, None
+            if not base:
+                sa = "/var/run/secrets/kubernetes.io/serviceaccount"
+                base = f"https://{os.environ['KUBERNETES_SERVICE_HOST']}:{os.environ['KUBERNETES_SERVICE_PORT']}"
+                headers["Authorization"] = "Bearer " + open(f"{sa}/token").read().strip()
+                ctx = ssl.create_default_context(cafile=f"{sa}/ca.crt")
             with urllib.request.urlopen(urllib.request.Request(base + path, headers=headers), timeout=15, context=ctx) as r:
                 return json.loads(r.read())
-        except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                # A checked object that doesn't exist fails the check.
+                raise HTTPError(409, {"error": "not found in kubernetes", "path": path.split("?")[0]})
+            raise HTTPError(502, {"error": "kubernetes refused", "status": e.code})
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError, KeyError) as e:
             raise HTTPError(502, {"error": "kubernetes unavailable", "detail": str(e)[:200]})
 
     def check_writers(self):
