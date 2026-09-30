@@ -65,6 +65,7 @@ This launcher's runs that have not finished.
 | `LAUNCHER_CONFIG` | `/config/launcher.json` | the targets file below |
 | `LAUNCHER_KEYS_FILE` / `LAUNCHER_KEYS` | required | accepted keys, one per line or comma-separated; list two while rotating |
 | `PORT` | `8080` | |
+| `KUBE_API_URL` | in-cluster | override the Kubernetes API for `image_checks` (tests) |
 
 ```json
 {
@@ -72,6 +73,9 @@ This launcher's runs that have not finished.
   "location": "my-code-location",
   "repository": "__repository__",
   "required_digests": ["app"],
+  "image_checks": [
+    {"namespace": "apps", "deployment": "my-code-location", "digest": "app", "env": ["DAGSTER_CURRENT_IMAGE"]}
+  ],
   "targets": {
     "slice": {
       "job": "slice_job",
@@ -83,6 +87,12 @@ This launcher's runs that have not finished.
   }
 }
 ```
+
+`image_checks` (optional) makes the candidate's digests more than a claim:
+before launching, the launcher reads each Deployment and refuses (`409`)
+unless every container image (or only those named in `containers`) and every
+env var named in `env` ends in `@<that digest>`, and the rollout has finished.
+This needs `get` on those Deployments for the launcher's service account.
 
 `owner` scopes everything: runs are found and authorized by the
 `launcher/owner` tag, so two launchers with different owners never see each

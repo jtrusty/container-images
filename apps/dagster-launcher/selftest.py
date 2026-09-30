@@ -10,6 +10,8 @@ beyond loopback. Each case is one of the launcher's promises:
   foreign run refusal    a run this launcher did not start reads as not found
   serialization          a different candidate is refused while a run is active
   supersede              supersede terminates, and nothing starts until terminal
+  image check            nothing launches unless the code location runs the
+                         candidate's digest, fully rolled out
   auth                   no key or a wrong key is refused
 """
 
@@ -29,6 +31,17 @@ class FakeDagster:
     def __init__(self):
         self.runs = {}
         self.launches = []
+        self.deployment = None
+
+    def deploy(self, digest, rolled_out=True):
+        image = "registry.example/app@" + digest
+        self.deployment = {
+            "metadata": {"generation": 2},
+            "spec": {"replicas": 1, "template": {"spec": {"containers": [
+                {"name": "app", "image": image, "env": [{"name": "CURRENT_IMAGE", "value": image}]}]}}},
+            "status": {"observedGeneration": 2, "replicas": 1 if rolled_out else 2,
+                       "updatedReplicas": 1, "availableReplicas": 1 if rolled_out else 2},
+        }
 
     def handle(self, query, v):
         if "launchRun" in query:
@@ -73,11 +86,22 @@ def main():
             self.end_headers()
             self.wfile.write(data)
 
+        def do_GET(self):
+            ok = self.path == "/apis/apps/v1/namespaces/ns/deployments/code" and fake.deployment
+            data = json.dumps(fake.deployment if ok else {"kind": "Status", "code": 404}).encode()
+            self.send_response(200 if ok else 404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
     _, gql = serve(G)
+    os.environ["KUBE_API_URL"] = gql
     config = {
         "owner": "selftest",
         "location": "example-location",
         "required_digests": ["app"],
+        "image_checks": [{"namespace": "ns", "deployment": "code", "digest": "app", "env": ["CURRENT_IMAGE"]}],
         "targets": {
             "slice": {
                 "job": "slice_job",
@@ -145,6 +169,20 @@ def main():
         check(name, s == 400 and not fake.launches, (s, b))
 
     s, b = call("POST", "/launch", good)
+    check("image check: missing deployment refused", s == 502 and not fake.launches, (s, b))
+    fake.deploy("sha256:" + "e" * 64)
+    s, b = call("POST", "/launch", good)
+    check("image check: other digest refused", s == 409 and "not the candidate" in b["error"] and not fake.launches, (s, b))
+    fake.deploy(dig["app"], rolled_out=False)
+    s, b = call("POST", "/launch", good)
+    check("image check: rollout in progress refused", s == 409 and "rolling out" in b["error"] and not fake.launches, (s, b))
+    fake.deploy(dig["app"])
+    fake.deployment["spec"]["template"]["spec"]["containers"][0]["env"][0]["value"] = "registry.example/app:latest"
+    s, b = call("POST", "/launch", good)
+    check("image check: run image env must match too", s == 409 and not fake.launches, (s, b))
+    fake.deploy(dig["app"])
+
+    s, b = call("POST", "/launch", good)
     check("launch", s == 201 and len(fake.launches) == 1, (s, b))
     rid = b.get("run_id")
     p = fake.launches[0]
@@ -160,8 +198,10 @@ def main():
     s, b = call("GET", f"/runs/{rid}")
     check("status", s == 200 and b["status"] == "QUEUED" and b["candidate"]["sha"] == sha1 and not b["terminal"], b)
 
+    checks = l.cfg.pop("image_checks")  # reach the reuse logic, not the image check
     s, b = call("POST", "/launch", {**good, "candidate": {**good["candidate"], "digests": {"app": "sha256:" + "d" * 64}}})
-    check("same sha, different digest is a different candidate", s == 409, (s, b))
+    l.cfg["image_checks"] = checks
+    check("same sha, different digest is never reused", s == 409 and b["error"] == "busy" and len(fake.launches) == 1, (s, b))
     s, b = call("POST", "/launch", good)
     check("retry is idempotent", s == 200 and b["reused"] and b["run_id"] == rid and len(fake.launches) == 1, (s, b))
 

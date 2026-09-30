@@ -31,6 +31,7 @@ import hmac
 import json
 import os
 import re
+import ssl
 import sys
 import threading
 import urllib.error
@@ -96,6 +97,44 @@ class Launcher:
         self.lock = threading.Lock()
         if not self.keys:
             raise SystemExit("no launcher keys configured")
+        for chk in config.get("image_checks", []):
+            if chk["digest"] not in config.get("required_digests", []):
+                raise SystemExit(f"image_checks digest {chk['digest']!r} is not in required_digests")
+
+    # --- Kubernetes --------------------------------------------------------
+    def kube_get(self, path):
+        base = os.environ.get("KUBE_API_URL")
+        headers, ctx = {}, None
+        if not base:
+            sa = "/var/run/secrets/kubernetes.io/serviceaccount"
+            base = f"https://{os.environ['KUBERNETES_SERVICE_HOST']}:{os.environ['KUBERNETES_SERVICE_PORT']}"
+            headers["Authorization"] = "Bearer " + open(f"{sa}/token").read().strip()
+            ctx = ssl.create_default_context(cafile=f"{sa}/ca.crt")
+        try:
+            with urllib.request.urlopen(urllib.request.Request(base + path, headers=headers), timeout=15, context=ctx) as r:
+                return json.loads(r.read())
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
+            raise HTTPError(502, {"error": "kubernetes unavailable", "detail": str(e)[:200]})
+
+    def check_images(self, digests):
+        """Refuse unless each checked Deployment is fully rolled out on the
+        candidate's digest. Otherwise the run could use an older image while
+        its tags claim the candidate's."""
+        for chk in self.cfg.get("image_checks", []):
+            want = digests[chk["digest"]]
+            name = f"{chk['namespace']}/{chk['deployment']}"
+            d = self.kube_get(f"/apis/apps/v1/namespaces/{chk['namespace']}/deployments/{chk['deployment']}")
+            pod = d["spec"]["template"]["spec"]
+            images = [c["image"] for c in pod["containers"] if c["name"] in chk.get("containers", [c["name"]])]
+            images += [e.get("value", "") for c in pod["containers"] for e in c.get("env", [])
+                       if e["name"] in chk.get("env", [])]
+            if not images or any(not i.endswith("@" + want) for i in images):
+                raise HTTPError(409, {"error": "deployed image is not the candidate", "deployment": name,
+                                      "digest": chk["digest"]})
+            st, want_n = d.get("status", {}), d["spec"].get("replicas", 1)
+            if not (st.get("observedGeneration", 0) >= d["metadata"]["generation"]
+                    and st.get("replicas", 0) == st.get("updatedReplicas", 0) == st.get("availableReplicas", 0) == want_n):
+                raise HTTPError(409, {"error": "deployment is still rolling out", "deployment": name})
 
     # --- Dagster -----------------------------------------------------------
     def gql(self, query, variables):
@@ -213,6 +252,7 @@ class Launcher:
     def launch(self, req):
         target_name, target, sha, release, digests, params, supersede = self.validate_launch(req)
         with self.lock:
+            self.check_images(digests)
             active = self.active_runs()
             if active:
                 same = all(r["candidate"]["sha"] == sha and r["candidate"]["release"] == release
