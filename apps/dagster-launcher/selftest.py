@@ -10,6 +10,9 @@ beyond loopback. Each case is one of the launcher's promises:
   foreign run refusal    a run this launcher did not start reads as not found
   serialization          a different candidate is refused while a run is active
   supersede              supersede terminates, and nothing starts until terminal
+  writer check           nothing launches while an earlier run's pods
+                         (run or step) are still Pending or Running, even
+                         if Dagster already reports the run finished
   image check            nothing launches unless the code location runs the
                          candidate's digest, fully rolled out
   auth                   no key or a wrong key is refused
@@ -32,6 +35,7 @@ class FakeDagster:
         self.runs = {}
         self.launches = []
         self.deployment = None
+        self.pods = []
 
     def deploy(self, digest, rolled_out=True):
         image = "registry.example/app@" + digest
@@ -87,8 +91,17 @@ def main():
             self.wfile.write(data)
 
         def do_GET(self):
-            ok = self.path == "/apis/apps/v1/namespaces/ns/deployments/code" and fake.deployment
-            data = json.dumps(fake.deployment if ok else {"kind": "Status", "code": 404}).encode()
+            if self.path.startswith("/api/v1/namespaces/ns/pods"):
+                if "?" in self.path:
+                    assert "labelSelector=role%3Dwriter" in self.path, self.path
+                    items = [p for p in fake.pods if p["metadata"].get("labels", {}).get("role") == "writer"]
+                else:
+                    items = fake.pods
+                ok, body = True, {"items": items}
+            else:
+                ok = self.path == "/apis/apps/v1/namespaces/ns/deployments/code" and fake.deployment
+                body = fake.deployment if ok else {"kind": "Status", "code": 404}
+            data = json.dumps(body).encode()
             self.send_response(200 if ok else 404)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -101,6 +114,8 @@ def main():
         "owner": "selftest",
         "location": "example-location",
         "required_digests": ["app"],
+        "writer_checks": [{"namespace": "ns", "label_selector": "role=writer"},
+                          {"namespace": "ns", "service_account": "runner-release"}],
         "image_checks": [{"namespace": "ns", "deployment": "code", "digest": "app", "env": ["CURRENT_IMAGE"]}],
         "targets": {
             "slice": {
@@ -230,6 +245,19 @@ def main():
     fake.runs[rid]["status"] = "CANCELED"
     s, b = call("GET", f"/runs/{rid}")
     check("superseded run reads terminal, not success", b["terminal"] and not b["success"], b)
+    fake.pods = [{"metadata": {"name": "step-a", "labels": {"role": "writer"}}, "status": {"phase": "Running"}},
+                 {"metadata": {"name": "run-old", "labels": {"role": "writer"}}, "status": {"phase": "Succeeded"}},
+                 {"metadata": {"name": "other"}, "spec": {"serviceAccountName": "someone"}, "status": {"phase": "Running"}}]
+    s, b = call("POST", "/launch", {**next_, "supersede": True})
+    check("writer check: terminal run with a live step pod refused", s == 409 and b["error"] == "writers still running"
+          and b["pods"] == ["step-a"] and len(fake.launches) == 1, (s, b))
+    fake.pods[0]["status"]["phase"] = "Failed"
+    fake.pods.append({"metadata": {"name": "unlabelled"}, "spec": {"serviceAccountName": "runner-release"},
+                      "status": {"phase": "Pending"}})
+    s, b = call("POST", "/launch", {**next_, "supersede": True})
+    check("writer check: unlabelled pod caught by service account", s == 409 and b["pods"] == ["unlabelled"]
+          and len(fake.launches) == 1, (s, b))
+    fake.pods[-1]["status"]["phase"] = "Succeeded"
     s, b = call("POST", "/launch", {**next_, "supersede": True})
     check("supersede: launches once terminal", s == 201 and len(fake.launches) == 2, (s, b))
     rid2 = b["run_id"]
