@@ -184,7 +184,8 @@ def main():
         check(name, s == 400 and not fake.launches, (s, b))
 
     s, b = call("POST", "/launch", good)
-    check("image check: missing deployment refused", s == 502 and not fake.launches, (s, b))
+    check("image check: missing deployment refused", s == 409 and b["error"] == "not found in kubernetes"
+          and not fake.launches, (s, b))
     fake.deploy("sha256:" + "e" * 64)
     s, b = call("POST", "/launch", good)
     check("image check: other digest refused", s == 409 and "not the candidate" in b["error"] and not fake.launches, (s, b))
