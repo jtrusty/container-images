@@ -1,0 +1,205 @@
+"""End-to-end checks of the launcher against a fake Dagster GraphQL API.
+
+Runs inside the image (`python /app/selftest.py`) with no network access
+beyond loopback. Each case is one of the launcher's promises:
+
+  launch + status        an allowed target starts a run; its status reads back
+  retry is idempotent    the same candidate returns the same run
+  target refusal         a target outside the config is refused
+  override refusal       unknown params, run config or tags are refused
+  foreign run refusal    a run this launcher did not start reads as not found
+  serialization          a different candidate is refused while a run is active
+  supersede              supersede terminates, and nothing starts until terminal
+  auth                   no key or a wrong key is refused
+"""
+
+import json
+import os
+import sys
+import threading
+import urllib.error
+import urllib.request
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import launcher  # noqa: E402
+
+class FakeDagster:
+    def __init__(self):
+        self.runs = {}
+        self.launches = []
+
+    def handle(self, query, v):
+        if "launchRun" in query:
+            p = v["p"]
+            self.launches.append(p)
+            rid = str(uuid.uuid4())
+            self.runs[rid] = {"runId": rid, "status": "QUEUED", "tags": p["executionMetadata"]["tags"]}
+            return {"launchRun": {"__typename": "LaunchRunSuccess", "run": {"runId": rid, "status": "QUEUED"}}}
+        if "runsOrError" in query:
+            want = {(t["key"], t["value"]) for t in v["tags"]}
+            res = [r for r in self.runs.values()
+                   if want <= {(t["key"], t["value"]) for t in r["tags"]} and r["status"] in v["statuses"]]
+            return {"runsOrError": {"__typename": "Runs", "results": res}}
+        if "runOrError" in query:
+            r = self.runs.get(v["id"])
+            return {"runOrError": {"__typename": "Run", **r} if r else {"__typename": "RunNotFoundError", "message": "nope"}}
+        if "terminateRun" in query:
+            self.runs[v["id"]]["status"] = "CANCELING"
+            return {"terminateRun": {"__typename": "TerminateRunSuccess"}}
+        raise AssertionError(query)
+
+
+def serve(handler_cls):
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+def main():
+    fake = FakeDagster()
+
+    class G(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            data = json.dumps({"data": fake.handle(body["query"], body["variables"])}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    _, gql = serve(G)
+    config = {
+        "owner": "selftest",
+        "location": "example-location",
+        "required_digests": ["app"],
+        "targets": {
+            "slice": {
+                "job": "slice_job",
+                "run_config": {"ops": {"build": {"config": {"scope": "${scope}", "limit": "${limit}"}}}},
+                "params": {
+                    "scope": {"type": "string", "enum": ["control"], "required": True},
+                    "limit": {"type": "integer", "min": 1, "max": 100},
+                },
+                "tags": {"dagster-k8s/config": '{"pod_spec_config": {"service_account_name": "runner-release"}}'},
+            }
+        },
+    }
+    l = launcher.Launcher(config, ["k1", "k2"], gql + "/graphql")
+    _, base = serve(launcher.make_handler(l))
+
+    def call(method, path, body=None, key="k1"):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(base + path, data=data, method=method)
+        if data:
+            req.add_header("Content-Type", "application/json")
+        if key:
+            req.add_header("Authorization", "Bearer " + key)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    failures = []
+
+    def check(name, cond, detail=""):
+        print(("ok   " if cond else "FAIL ") + name + ("" if cond else f"  {detail}"))
+        if not cond:
+            failures.append(name)
+
+    sha1, sha2 = "a" * 40, "b" * 40
+    dig = {"app": "sha256:" + "c" * 64}
+    good = {"target": "slice", "candidate": {"sha": sha1, "digests": dig, "release": "r-42"}, "params": {"scope": "control", "limit": 5}}
+
+    s, b = call("GET", "/healthz", key=None)
+    check("healthz needs no key", s == 200)
+    s, _ = call("POST", "/launch", good, key=None)
+    check("auth: missing key refused", s == 401)
+    s, _ = call("POST", "/launch", good, key="nope")
+    check("auth: wrong key refused", s == 401)
+    s, _ = call("GET", "/active", key="k2")
+    check("auth: second key accepted (rotation)", s == 200)
+
+    s, b = call("POST", "/launch", {**good, "target": "production_job"})
+    check("target refusal", s == 403 and not fake.launches, (s, b))
+    for name, bad in [
+        ("override refusal: run_config", {**good, "run_config": {}}),
+        ("override refusal: tags", {**good, "tags": {"dagster-k8s/config": "{}"}}),
+        ("override refusal: location", {**good, "location": "other"}),
+        ("override refusal: unknown param", {**good, "params": {"scope": "control", "bucket": "x"}}),
+        ("override refusal: enum", {**good, "params": {"scope": "everything"}}),
+        ("override refusal: type", {**good, "params": {"scope": "control", "limit": "5"}}),
+        ("override refusal: range", {**good, "params": {"scope": "control", "limit": 10_000}}),
+        ("candidate: bad release", {**good, "candidate": {"sha": sha1, "digests": dig, "release": "a b"}}),
+        ("candidate: bad sha", {**good, "candidate": {"sha": "main", "digests": dig}}),
+        ("candidate: missing digest", {**good, "candidate": {"sha": sha1, "digests": {}}}),
+        ("candidate: extra digest", {**good, "candidate": {"sha": sha1, "digests": {**dig, "x": dig["app"]}}}),
+    ]:
+        s, b = call("POST", "/launch", bad)
+        check(name, s == 400 and not fake.launches, (s, b))
+
+    s, b = call("POST", "/launch", good)
+    check("launch", s == 201 and len(fake.launches) == 1, (s, b))
+    rid = b.get("run_id")
+    p = fake.launches[0]
+    check("launch uses fixed location and job",
+          p["selector"]["repositoryLocationName"] == "example-location" and p["selector"]["jobName"] == "slice_job")
+    check("launch renders typed params",
+          p["runConfigData"] == {"ops": {"build": {"config": {"scope": "control", "limit": 5}}}}, p["runConfigData"])
+    tags = {t["key"]: t["value"] for t in p["executionMetadata"]["tags"]}
+    check("launch stamps owner, candidate and fixed tags",
+          tags.get("launcher/owner") == "selftest" and tags.get("launcher/candidate-sha") == sha1
+          and tags.get("launcher/digest-app") == dig["app"] and tags.get("launcher/release") == "r-42" and "runner-release" in tags.get("dagster-k8s/config", ""), tags)
+
+    s, b = call("GET", f"/runs/{rid}")
+    check("status", s == 200 and b["status"] == "QUEUED" and b["candidate"]["sha"] == sha1 and not b["terminal"], b)
+
+    s, b = call("POST", "/launch", {**good, "candidate": {**good["candidate"], "digests": {"app": "sha256:" + "d" * 64}}})
+    check("same sha, different digest is a different candidate", s == 409, (s, b))
+    s, b = call("POST", "/launch", good)
+    check("retry is idempotent", s == 200 and b["reused"] and b["run_id"] == rid and len(fake.launches) == 1, (s, b))
+
+    foreign = str(uuid.uuid4())
+    fake.runs[foreign] = {"runId": foreign, "status": "STARTED", "tags": [{"key": "launcher/owner", "value": "someone-else"}]}
+    s, b = call("GET", f"/runs/{foreign}")
+    check("foreign run refusal", s == 404, (s, b))
+    s, b = call("GET", f"/runs/{uuid.uuid4()}")
+    check("missing run looks the same", s == 404, (s, b))
+    s, b = call("GET", "/runs/../active")
+    check("path games refused", s in (401, 404), (s, b))
+    s, b = call("GET", "/active")
+    check("active lists only own runs", [r["run_id"] for r in b["active"]] == [rid], b)
+
+    next_ = {**good, "candidate": {"sha": sha2, "digests": dig}}
+    s, b = call("POST", "/launch", next_)
+    check("serialization: different candidate refused while active", s == 409 and b["error"] == "busy"
+          and len(fake.launches) == 1, (s, b))
+
+    s, b = call("POST", "/launch", {**next_, "supersede": True})
+    check("supersede: terminates, still refuses", s == 409 and b["error"] == "superseding"
+          and fake.runs[rid]["status"] == "CANCELING" and len(fake.launches) == 1, (s, b))
+    s, b = call("POST", "/launch", {**next_, "supersede": True})
+    check("supersede: refused until terminal", s == 409 and len(fake.launches) == 1, (s, b))
+
+    fake.runs[rid]["status"] = "CANCELED"
+    s, b = call("GET", f"/runs/{rid}")
+    check("superseded run reads terminal, not success", b["terminal"] and not b["success"], b)
+    s, b = call("POST", "/launch", {**next_, "supersede": True})
+    check("supersede: launches once terminal", s == 201 and len(fake.launches) == 2, (s, b))
+    rid2 = b["run_id"]
+    fake.runs[rid2]["status"] = "SUCCESS"
+    s, b = call("GET", f"/runs/{rid2}")
+    check("success reads success", b["terminal"] and b["success"] and b["candidate"]["sha"] == sha2, b)
+
+    print(f"\n{len(failures)} failed" if failures else "\nall checks passed")
+    sys.exit(1 if failures else 0)
+
+
+if __name__ == "__main__":
+    main()
