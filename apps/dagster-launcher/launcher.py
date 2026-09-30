@@ -35,6 +35,7 @@ import ssl
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -115,6 +116,28 @@ class Launcher:
                 return json.loads(r.read())
         except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
             raise HTTPError(502, {"error": "kubernetes unavailable", "detail": str(e)[:200]})
+
+    def check_writers(self):
+        """Refuse while any pod matching a writer check is still Pending or
+        Running. A run's status can be terminal while pods it started (step
+        Jobs under a k8s executor) are still writing; the status alone is not
+        proof that the previous writer stopped."""
+        for chk in self.cfg.get("writer_checks", []):
+            path = f"/api/v1/namespaces/{chk['namespace']}/pods"
+            if chk.get("label_selector"):
+                path += "?" + urllib.parse.urlencode({"labelSelector": chk["label_selector"]})
+            pods = self.kube_get(path)["items"]
+            # service_account: matched on the pod spec, which admission can pin,
+            # rather than on labels, which whoever creates the pod chooses.
+            if chk.get("service_account"):
+                pods = [p for p in pods if p.get("spec", {}).get("serviceAccountName") == chk["service_account"]]
+            # A pod being deleted is still Running until its processes exit.
+            live = sorted(p["metadata"]["name"] for p in pods
+                          if p.get("status", {}).get("phase") in ("Pending", "Running"))
+            if live:
+                raise HTTPError(409, {"error": "writers still running",
+                                      "detail": "pods from an earlier run have not stopped; retry",
+                                      "pods": live[:20]})
 
     def check_images(self, digests):
         """Refuse unless each checked Deployment is fully rolled out on the
@@ -266,6 +289,7 @@ class Launcher:
                     return 409, {"error": "superseding", "detail": "earlier run asked to terminate; retry until it is finished",
                                  "active": active}
                 return 409, {"error": "busy", "detail": "an earlier run is still active", "active": active}
+            self.check_writers()
             p = f"{self.prefix}/"
             tags = [self.owner_tag(), {"key": p + "target", "value": target_name}, {"key": p + "candidate-sha", "value": sha}]
             if release:
