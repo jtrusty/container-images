@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.26.0@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
+# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # cedricziel/truenas-mcp built from source at the release tag's commit.
 # Mirrors upstream's own Dockerfile: static Go binary on
 # distroless static (CA certificates for the target's TLS, nonroot, no shell).
