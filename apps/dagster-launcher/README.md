@@ -61,6 +61,9 @@ can't break out of the surrounding string or JSON. A free-form `string` param
 never can. Bounded integer params are the way to let a caller size a run (for
 example its pod's memory and CPU) without letting it touch anything else.
 
+A run tag whose whole value is one placeholder (`"${classification}"`) gets
+that value's text, so any scalar param, string included, can label a run.
+
 A placeholder naming an undeclared param, a digest outside
 `required_digests`, or a string param embedded in a longer string stops the
 launcher at startup, as does an invalid `default`.

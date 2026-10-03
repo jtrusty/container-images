@@ -183,10 +183,17 @@ class Launcher:
                     for m in EMBEDDED_RE.finditer(v):
                         check_ref(v, m.group(1), embedded=True)
         walk(target.get("run_config", {}))
-        # Tag values are always strings, so every reference in them is embedded.
+        # A tag value is a string: a whole-value placeholder becomes that value's
+        # text, so any scalar works; inside a longer value (JSON) only the
+        # embeddable types do.
         for k, v in target.get("tags", {}).items():
-            for m in EMBEDDED_RE.finditer(v):
-                check_ref(f"tag {k}", m.group(1), embedded=True)
+            if m := PLACEHOLDER_RE.fullmatch(v):
+                check_ref(f"tag {k}", m.group(1), embedded=False)
+                if schema.get(m.group(1), {}).get("type") == "array":
+                    raise SystemExit(f"target {name!r}: tag {k} can't take an array param")
+            else:
+                for m in EMBEDDED_RE.finditer(v):
+                    check_ref(f"tag {k}", m.group(1), embedded=True)
         if self.cfg.get("usage") and not self.cfg["usage"].get("metrics_url"):
             raise SystemExit("usage needs metrics_url")
 
@@ -418,7 +425,8 @@ class Launcher:
                 tags.append({"key": p + "release", "value": release})
             tags += [{"key": p + "digest-" + k, "value": v} for k, v in sorted(digests.items())]
             cand = {"sha": sha, "release": release, "digests": digests}
-            tags += [{"key": k, "value": self.render(v, params, cand)} for k, v in sorted(target.get("tags", {}).items())]
+            tags += [{"key": k, "value": text(self.render(v, params, cand))}
+                     for k, v in sorted(target.get("tags", {}).items())]
             selector = {
                 "repositoryLocationName": self.cfg["location"],
                 "repositoryName": self.cfg.get("repository", "__repository__"),

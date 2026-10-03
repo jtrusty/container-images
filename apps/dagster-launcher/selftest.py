@@ -154,9 +154,11 @@ def main():
                 "job": "sized_job",
                 "run_config": {"limits": {"memory": "${mem}", "cpu": "${cpu}m"}},
                 "params": {"mem": {"type": "integer", "min": 1, "max": 64, "required": True},
-                           "cpu": {"type": "integer", "min": 100, "max": 8000, "required": True}},
+                           "cpu": {"type": "integer", "min": 100, "max": 8000, "required": True},
+                           "kind": {"type": "string", "enum": ["pilot", "calibration"], "default": "pilot"}},
                 "tags": {"dagster-k8s/config": '{"container_config": {"resources": {"limits": '
-                                               '{"memory": ${mem}, "cpu": "${cpu}m"}}}}'},
+                                               '{"memory": ${mem}, "cpu": "${cpu}m"}}}}',
+                         "kind": "${kind}", "size": "${mem}"},
             },
             "slice": {
                 "job": "slice_job",
@@ -365,6 +367,8 @@ def main():
 
     refused("config refusal: free-form string embedded in a tag",
             {"job": "j", "params": {"s": {"type": "string"}}, "tags": {"t": '{"a": "${s}"}'}})
+    refused("config refusal: array param as a tag value",
+            {"job": "j", "params": {"a": {"type": "array", "items": {"type": "string"}}}, "tags": {"t": "${a}"}})
     refused("config refusal: free-form string embedded in run config",
             {"job": "j", "params": {"s": {"type": "string"}}, "run_config": {"x": "pre-${s}"}})
 
@@ -377,6 +381,8 @@ def main():
     tags = {t["key"]: t["value"] for t in p["executionMetadata"]["tags"]}
     check("embedded values: integer rendered inside a string",
           p["runConfigData"] == {"limits": {"memory": 4, "cpu": "500m"}}, p["runConfigData"])
+    check("whole-value tag placeholders: string and integer params as tag text",
+          tags.get("kind") == "pilot" and tags.get("size") == "4", tags)
     check("embedded values: JSON run tag stays valid JSON",
           json.loads(tags["dagster-k8s/config"]) == {"container_config": {"resources": {"limits": {"memory": 4, "cpu": "500m"}}}},
           tags.get("dagster-k8s/config"))
