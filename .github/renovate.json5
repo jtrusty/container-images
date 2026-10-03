@@ -2,6 +2,11 @@
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
   extends: ["config:recommended", "helpers:pinGitHubActionDigests"],
   dependencyDashboard: true,
+  // Keep Renovate's PRs current with main after every merge, so each one is
+  // tested against what it will land on. CI here runs on GitHub-hosted
+  // runners, free for a public repo. main doesn't require up-to-date
+  // branches to merge; this keeps the bot's PRs fresh without that rule.
+  rebaseWhen: "behind-base-branch",
   customManagers: [
     {
       // The upstream of every image: a renovate comment, then VERSION and DIGEST.
