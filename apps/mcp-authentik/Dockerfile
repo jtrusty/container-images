@@ -8,7 +8,7 @@
 ARG VERSION=v0.8.1
 ARG DIGEST=01e26e633491d8ab11496ee3eb2cb9ee56edb207
 
-FROM docker.io/library/node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS build
+FROM docker.io/library/node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS build
 ARG DIGEST
 ADD --keep-git-dir=false https://github.com/Samik081/mcp-authentik.git#${DIGEST} /src
 WORKDIR /src
@@ -16,7 +16,7 @@ RUN npm ci \
  && npm run build \
  && npm prune --omit=dev
 
-FROM docker.io/library/node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402
+FROM docker.io/library/node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1
 LABEL org.opencontainers.image.description="authentik MCP server, built from source"
 ENV NODE_ENV=production \
     MCP_PORT=3000 \
