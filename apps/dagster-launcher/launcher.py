@@ -28,6 +28,7 @@ Standard library only. Configuration: see README.md.
 """
 
 import hmac
+import hashlib
 import json
 import os
 import re
@@ -47,6 +48,20 @@ DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 DIGEST_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 RUN_ID_RE = re.compile(r"^[0-9a-f-]{8,64}$")
 RELEASE_RE = re.compile(r"^[A-Za-z0-9._-]{1,63}$")
+# A run_config string that is exactly "${...}": a param name, or a value taken
+# from the verified candidate (candidate.sha, candidate.release,
+# candidate.digests.<name>) so the caller cannot choose it separately.
+PLACEHOLDER_RE = re.compile(r"\$\{(candidate\.(?:sha|release|digests\.[a-z][a-z0-9-]{0,30})|[a-z_][a-z0-9_]*)\}")
+SCALAR_TYPES = {"string": str, "integer": int, "boolean": bool}
+
+
+def params_digest(params):
+    """Stable identity of a launch's params, after defaults are filled in."""
+    return "sha256:" + hashlib.sha256(json.dumps(params, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+# Runs started before params were tagged all had empty params.
+EMPTY_PARAMS_DIGEST = params_digest({})
 
 LAUNCH = """
 mutation Launch($p: ExecutionParams!) {
@@ -101,6 +116,38 @@ class Launcher:
         for chk in config.get("image_checks", []):
             if chk["digest"] not in config.get("required_digests", []):
                 raise SystemExit(f"image_checks digest {chk['digest']!r} is not in required_digests")
+        for name, target in config["targets"].items():
+            self.check_target_config(name, target)
+
+    def check_target_config(self, name, target):
+        """Refuse at startup a target whose params or run_config can't work."""
+        schema = target.get("params", {})
+        for pname, spec in schema.items():
+            if spec.get("type") not in (*SCALAR_TYPES, "array"):
+                raise SystemExit(f"target {name!r} param {pname!r}: unknown type {spec.get('type')!r}")
+            if spec["type"] == "array" and spec.get("items", {}).get("type") not in SCALAR_TYPES:
+                raise SystemExit(f"target {name!r} param {pname!r}: array items need a scalar type")
+            if "default" in spec:
+                try:
+                    self.check_param(pname, spec, spec["default"])
+                except HTTPError as e:
+                    raise SystemExit(f"target {name!r} param {pname!r}: default is invalid: {e.body}")
+
+        def walk(v):
+            if isinstance(v, dict):
+                for x in v.values():
+                    walk(x)
+            elif isinstance(v, list):
+                for x in v:
+                    walk(x)
+            elif isinstance(v, str) and (m := PLACEHOLDER_RE.fullmatch(v)):
+                ref = m.group(1)
+                if ref.startswith("candidate.digests."):
+                    if ref.split(".", 2)[2] not in self.cfg.get("required_digests", []):
+                        raise SystemExit(f"target {name!r}: {v} names a digest not in required_digests")
+                elif not ref.startswith("candidate.") and ref not in schema:
+                    raise SystemExit(f"target {name!r}: {v} names an undeclared param")
+        walk(target.get("run_config", {}))
 
     # --- Kubernetes --------------------------------------------------------
     def kube_get(self, path):
@@ -199,6 +246,7 @@ class Launcher:
             "terminal": run["status"] in TERMINAL,
             "success": run["status"] == "SUCCESS",
             "target": tags.get(p + "target"),
+            "params_digest": tags.get(p + "params", EMPTY_PARAMS_DIGEST),
             "candidate": {
                 "sha": tags.get(p + "candidate-sha"),
                 "release": tags.get(p + "release"),
@@ -246,45 +294,66 @@ class Launcher:
             if name not in params:
                 if spec.get("required"):
                     raise HTTPError(400, {"error": "missing param", "param": name})
+                if "default" in spec:
+                    params[name] = spec["default"]
                 continue
-            v = params[name]
-            t = spec["type"]
-            ok = (t == "string" and isinstance(v, str)) or (t == "integer" and isinstance(v, int) and not isinstance(v, bool)) \
-                or (t == "boolean" and isinstance(v, bool))
-            if not ok:
-                raise HTTPError(400, {"error": "bad param type", "param": name, "expected": t})
-            if "enum" in spec and v not in spec["enum"]:
-                raise HTTPError(400, {"error": "param not in enum", "param": name})
-            if t == "string" and "pattern" in spec and not re.fullmatch(spec["pattern"], v):
-                raise HTTPError(400, {"error": "param does not match pattern", "param": name})
-            if t == "integer" and not (spec.get("min", v) <= v <= spec.get("max", v)):
-                raise HTTPError(400, {"error": "param out of range", "param": name})
+            self.check_param(name, spec, params[name])
         supersede = req.get("supersede", False)
         if not isinstance(supersede, bool):
             raise HTTPError(400, {"error": "supersede must be boolean"})
         return target_name, target, cand["sha"], release, digests, params, supersede
 
-    def render(self, template, params):
-        """Substitute whole-string "${name}" placeholders with typed values."""
+    def check_param(self, name, spec, v):
+        """Check one value against its spec; arrays check every item."""
+        t = spec["type"]
+        if t == "array":
+            if not isinstance(v, list):
+                raise HTTPError(400, {"error": "bad param type", "param": name, "expected": "array"})
+            if not spec.get("min_items", 0) <= len(v) <= spec.get("max_items", len(v)):
+                raise HTTPError(400, {"error": "param has wrong number of items", "param": name})
+            if len({json.dumps(x, sort_keys=True) for x in v}) != len(v):
+                raise HTTPError(400, {"error": "param has duplicate items", "param": name})
+            for item in v:
+                self.check_param(name, spec["items"], item)
+            return
+        ok = isinstance(v, SCALAR_TYPES[t]) and not (t == "integer" and isinstance(v, bool))
+        if not ok:
+            raise HTTPError(400, {"error": "bad param type", "param": name, "expected": t})
+        if "enum" in spec and v not in spec["enum"]:
+            raise HTTPError(400, {"error": "param not in enum", "param": name})
+        if t == "string" and "pattern" in spec and not re.fullmatch(spec["pattern"], v):
+            raise HTTPError(400, {"error": "param does not match pattern", "param": name})
+        if t == "integer" and not (spec.get("min", v) <= v <= spec.get("max", v)):
+            raise HTTPError(400, {"error": "param out of range", "param": name})
+
+    def render(self, template, params, candidate):
+        """Substitute whole-string "${...}" placeholders with typed values."""
         if isinstance(template, dict):
-            return {k: self.render(v, params) for k, v in template.items()}
+            return {k: self.render(v, params, candidate) for k, v in template.items()}
         if isinstance(template, list):
-            return [self.render(v, params) for v in template]
+            return [self.render(v, params, candidate) for v in template]
         if isinstance(template, str):
-            m = re.fullmatch(r"\$\{([a-z_][a-z0-9_]*)\}", template)
+            m = PLACEHOLDER_RE.fullmatch(template)
             if m:
-                return params.get(m.group(1), None)
+                ref = m.group(1)
+                if ref.startswith("candidate.digests."):
+                    return candidate["digests"].get(ref.split(".", 2)[2])
+                if ref.startswith("candidate."):
+                    return candidate.get(ref.split(".", 1)[1])
+                return params.get(ref, None)
         return template
 
     # --- operations --------------------------------------------------------
     def launch(self, req):
         target_name, target, sha, release, digests, params, supersede = self.validate_launch(req)
+        pdigest = params_digest(params)
         with self.lock:
             self.check_images(digests)
             active = self.active_runs()
             if active:
                 same = all(r["candidate"]["sha"] == sha and r["candidate"]["release"] == release
-                           and r["candidate"]["digests"] == digests and r["target"] == target_name for r in active)
+                           and r["candidate"]["digests"] == digests and r["target"] == target_name
+                           and r["params_digest"] == pdigest for r in active)
                 if same:
                     return 200, {"reused": True, **active[0]}
                 if supersede:
@@ -296,7 +365,8 @@ class Launcher:
                 return 409, {"error": "busy", "detail": "an earlier run is still active", "active": active}
             self.check_writers()
             p = f"{self.prefix}/"
-            tags = [self.owner_tag(), {"key": p + "target", "value": target_name}, {"key": p + "candidate-sha", "value": sha}]
+            tags = [self.owner_tag(), {"key": p + "target", "value": target_name}, {"key": p + "candidate-sha", "value": sha},
+                    {"key": p + "params", "value": pdigest}]
             if release:
                 tags.append({"key": p + "release", "value": release})
             tags += [{"key": p + "digest-" + k, "value": v} for k, v in sorted(digests.items())]
@@ -310,7 +380,8 @@ class Launcher:
                 selector["assetSelection"] = [{"path": k.split("/")} for k in target["asset_selection"]]
             execution = {
                 "selector": selector,
-                "runConfigData": self.render(target.get("run_config", {}), params),
+                "runConfigData": self.render(target.get("run_config", {}), params,
+                                             {"sha": sha, "release": release, "digests": digests}),
                 "executionMetadata": {"tags": tags},
             }
             d = self.gql(LAUNCH, {"p": execution})["launchRun"]

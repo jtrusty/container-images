@@ -31,20 +31,38 @@ All endpoints except `/healthz` need `Authorization: Bearer <key>`.
 - `candidate.digests` must name exactly the config's `required_digests`.
 - `params` are checked against the target's schema: unknown names, wrong
   types, values outside an `enum`, `pattern` or `min`/`max` are refused (400).
+  An `array` param checks every item against `items`, its length against
+  `min_items`/`max_items`, and refuses duplicate items. An omitted param
+  takes its `default` if one is declared.
 - Any other field (run config, tags, location, job...) is refused (400).
 
 The launched run gets the config's code location, repository, job, asset
-selection, run config (with `"${param}"` placeholders filled from `params`)
-and tags, plus launcher tags: `launcher/owner`, `launcher/target`,
-`launcher/candidate-sha`, `launcher/release`, `launcher/digest-<name>`.
+selection, run config and tags, plus launcher tags: `launcher/owner`,
+`launcher/target`, `launcher/candidate-sha`, `launcher/release`,
+`launcher/digest-<name>` and `launcher/params` (a digest of the params after
+defaults).
+
+A run config string that is exactly `"${...}"` is replaced with a typed value:
+
+- `"${name}"`: the param `name` (a list stays a list).
+- `"${candidate.sha}"`, `"${candidate.release}"`,
+  `"${candidate.digests.<name>}"`: taken from the request's candidate after
+  it is validated. With `image_checks`, a digest has also been checked
+  against what the code location runs. Use these instead of a param when
+  the job needs the candidate's identity, so a caller cannot pass one value
+  to the image check and another to the job.
+
+A placeholder naming an undeclared param, or a digest outside
+`required_digests`, stops the launcher at startup, as does an invalid
+`default`.
 
 One run owned by the launcher is active at a time:
 
 | Situation | Response |
 | --- | --- |
 | nothing active | `201` `{run_id, status, reused: false}` |
-| same target and candidate active | `200` that run, `reused: true` (retries are safe) |
-| other candidate active | `409` `busy` |
+| same target, candidate and params active | `200` that run, `reused: true` (retries are safe) |
+| other candidate or params active | `409` `busy` |
 | other candidate active, `supersede: true` | the active run is asked to terminate; `409` `superseding` until Dagster reports it finished |
 | no active run, but pods matching `writer_checks` still live | `409` `writers still running` until they stop, then a normal launch |
 
@@ -108,7 +126,8 @@ This needs `get` on those Deployments for the launcher's service account.
 
 `owner` scopes everything: runs are found and authorized by the
 `launcher/owner` tag, so two launchers with different owners never see each
-other's runs. Parameter types are `string`, `integer` and `boolean`.
+other's runs. Parameter types are `string`, `integer`, `boolean` and `array`
+(of one of the other three).
 
 ## What it does not do
 

@@ -16,6 +16,13 @@ beyond loopback. Each case is one of the launcher's promises:
   image check            nothing launches unless the code location runs the
                          candidate's digest, fully rolled out
   auth                   no key or a wrong key is refused
+  list params            array params check each item, count and duplicates;
+                         an omitted param takes its declared default
+  candidate values       run config can take the verified candidate's digest,
+                         so the caller cannot pass a different one
+  params identity        a retry with different params is not the same run
+  config refusal         a target whose params or placeholders can't work
+                         stops the launcher at startup
 """
 
 import json
@@ -126,7 +133,18 @@ def main():
                     "limit": {"type": "integer", "min": 1, "max": 100},
                 },
                 "tags": {"dagster-k8s/config": '{"pod_spec_config": {"service_account_name": "runner-release"}}'},
-            }
+            },
+            "trial": {
+                "job": "trial_job",
+                "run_config": {"image": "${candidate.digests.app}", "sha": "${candidate.sha}",
+                               "outputs": "${outputs}", "faults": "${faults}"},
+                "params": {
+                    "outputs": {"type": "array", "required": True, "min_items": 1, "max_items": 2,
+                                "items": {"type": "string", "pattern": "[a-z]+/[a-z_]+"}},
+                    "faults": {"type": "array", "max_items": 1, "default": [],
+                               "items": {"type": "string", "enum": ["late", "lost"]}},
+                },
+            },
         },
     }
     l = launcher.Launcher(config, ["k1", "k2"], gql + "/graphql")
@@ -265,6 +283,52 @@ def main():
     fake.runs[rid2]["status"] = "SUCCESS"
     s, b = call("GET", f"/runs/{rid2}")
     check("success reads success", b["terminal"] and b["success"] and b["candidate"]["sha"] == sha2, b)
+
+    trial = {"target": "trial", "candidate": {"sha": sha2, "digests": dig}, "params": {"outputs": ["source/series"]}}
+    for name, params in [
+        ("list params: not a list", {"outputs": "source/series"}),
+        ("list params: empty below min_items", {"outputs": []}),
+        ("list params: over max_items", {"outputs": ["a/b", "c/d", "e/f"]}),
+        ("list params: duplicate items", {"outputs": ["a/b", "a/b"]}),
+        ("list params: item fails pattern", {"outputs": ["../etc"]}),
+        ("list params: item outside enum", {"outputs": ["a/b"], "faults": ["everything"]}),
+        ("list params: item wrong type", {"outputs": ["a/b"], "faults": [1]}),
+        ("candidate values: not a param", {"outputs": ["a/b"], "image": "sha256:" + "e" * 64}),
+    ]:
+        s, b = call("POST", "/launch", {**trial, "params": params})
+        check(name, s == 400 and len(fake.launches) == 2, (s, b))
+    s, b = call("POST", "/launch", trial)
+    check("list params: launch", s == 201 and len(fake.launches) == 3, (s, b))
+    rid3 = b.get("run_id")
+    p = fake.launches[-1]
+    check("list params: default and candidate values rendered",
+          p["runConfigData"] == {"image": dig["app"], "sha": sha2, "outputs": ["source/series"], "faults": []},
+          p["runConfigData"])
+    s, b = call("POST", "/launch", trial)
+    check("params identity: same params reused", s == 200 and b["reused"] and b["run_id"] == rid3, (s, b))
+    s, b = call("POST", "/launch", {**trial, "params": {"outputs": ["source/series"], "faults": ["late"]}})
+    check("params identity: different params not reused", s == 409 and b["error"] == "busy"
+          and len(fake.launches) == 3, (s, b))
+    s, b = call("GET", f"/runs/{rid3}")
+    check("params identity: status reports target and params digest",
+          b["target"] == "trial" and b["params_digest"] == launcher.params_digest(
+              {"outputs": ["source/series"], "faults": []}), b)
+    check("params identity: runs from before params were tagged read as empty params",
+          l.summary({"runId": rid, "status": "SUCCESS", "tags": []})["params_digest"] == launcher.params_digest({}))
+
+    def refused(name, target):
+        try:
+            launcher.Launcher({**config, "targets": {"t": target}}, ["k"], gql)
+        except SystemExit:
+            check(name, True)
+        else:
+            check(name, False, "launcher started")
+    refused("config refusal: undeclared placeholder", {"job": "j", "run_config": {"x": "${nope}"}})
+    refused("config refusal: unknown candidate digest", {"job": "j", "run_config": {"x": "${candidate.digests.db}"}})
+    refused("config refusal: invalid default", {"job": "j", "params": {
+        "f": {"type": "array", "default": ["x"], "items": {"type": "string", "enum": ["y"]}}}})
+    refused("config refusal: array without item type", {"job": "j", "params": {"f": {"type": "array"}}})
+    refused("config refusal: unknown param type", {"job": "j", "params": {"f": {"type": "object"}}})
 
     print(f"\n{len(failures)} failed" if failures else "\nall checks passed")
     sys.exit(1 if failures else 0)

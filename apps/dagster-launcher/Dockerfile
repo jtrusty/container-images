@@ -4,7 +4,7 @@
 # this directory (standard library only), so there is no upstream: VERSION is
 # this image's own, bumped by hand when launcher.py changes. See README.md.
 
-ARG VERSION=0.2.1
+ARG VERSION=0.3.0
 
 FROM gcr.io/distroless/python3-debian12:nonroot@sha256:7d1042ce588ab97019fe95c24ffca7bc5a82ccdac572511d5e09bda4435c89c5
 LABEL org.opencontainers.image.description="Constrained launcher for Dagster runs: allowlisted targets, typed parameters, one active run, status of its own runs only"
