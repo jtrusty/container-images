@@ -52,9 +52,18 @@ A run config string that is exactly `"${...}"` is replaced with a typed value:
   the job needs the candidate's identity, so a caller cannot pass one value
   to the image check and another to the job.
 
-A placeholder naming an undeclared param, or a digest outside
-`required_digests`, stops the launcher at startup, as does an invalid
-`default`.
+The same references can also sit inside a longer string, in run config or
+in a run tag's value: `"${cpu}m"`, or a `dagster-k8s/config` JSON tag such as
+`{"container_config": {"resources": {"limits": {"memory": ${mem}}}}}`. There
+they are replaced with their text. Only `integer` and `boolean` params and
+the candidate fields may appear inside a longer string, because their text
+can't break out of the surrounding string or JSON. A free-form `string` param
+never can. Bounded integer params are the way to let a caller size a run (for
+example its pod's memory and CPU) without letting it touch anything else.
+
+A placeholder naming an undeclared param, a digest outside
+`required_digests`, or a string param embedded in a longer string stops the
+launcher at startup, as does an invalid `default`.
 
 One run owned by the launcher is active at a time:
 
@@ -69,8 +78,35 @@ One run owned by the launcher is active at a time:
 ### `GET /runs/{run_id}`
 
 Status of a run this launcher started: `status`, `terminal`, `success`,
-`target`, `candidate`, start and end times. A run it did not start returns
-`404`, the same as a run that does not exist.
+`target`, `candidate`, `started_at`/`completed_at` (UTC ISO-8601), and
+`step_timings`: for each step its status, start and end, and every attempt
+(retries included). A time Dagster has not recorded is `null`, never guessed.
+A run it did not start returns `404`, the same as a run that does not exist.
+
+### `GET /runs/{run_id}/usage`
+
+Memory and CPU used by a run this launcher started, when `usage` is
+configured. Pods are found by the names Dagster's Kubernetes run launcher and
+step executor give them: the run worker (`dagster-run-<run id>`, including
+resumed workers) and one Job per step attempt
+(`dagster-step-<md5(run id + step key)>`, then `-1`, `-2`… for retries). So
+attempts whose pods are already deleted are still found in the metrics, and
+another run's pods never are. Each attempt reports, per container:
+
+- `samples`, `first_sample`, `last_sample`;
+- `memory_working_set_max_observed_bytes`: the largest sampled working set;
+- `memory_high_water_bytes`: the kernel's cgroup high-water mark
+  (`memory.peak`, cAdvisor's `container_memory_max_usage_bytes`) as of the
+  last sample, a lower bound if usage grew after it;
+- `cpu_seconds_observed` and `cpu_cores_max_observed`.
+
+Each attempt also reports `measured`, `observed_seconds` and `coverage`
+(observed sample span over the attempt's duration). The response states
+`sampling_interval_seconds` and its limits: values are maximums *observed* at
+that interval, so a shorter spike, or a whole pod shorter than the interval,
+can be missed. An attempt with no samples has `measured: false` and must be
+treated as unmeasured, not as zero. The launcher only runs its own fixed
+queries; there is no way to send it a query.
 
 ### `GET /active`
 
@@ -123,6 +159,14 @@ before launching, the launcher reads each Deployment and refuses (`409`)
 unless every container image (or only those named in `containers`) and every
 env var named in `env` ends in `@<that digest>`, and the rollout has finished.
 This needs `get` on those Deployments for the launcher's service account.
+
+`usage` (optional) enables `GET /runs/{id}/usage`:
+`{"metrics_url": "http://vmsingle:8428", "namespace": "apps", "scrape_interval_seconds": 30}`.
+`metrics_url` is a Prometheus-compatible query API that understands MetricsQL
+(VictoriaMetrics: the queries use `tfirst_over_time`/`tlast_over_time`) and
+holds cAdvisor container metrics with `namespace`, `pod` and `container`
+labels. `scrape_interval_seconds` is reported back as the sampling interval,
+so set it to the real kubelet/cAdvisor scrape interval.
 
 `owner` scopes everything: runs are found and authorized by the
 `launcher/owner` tag, so two launchers with different owners never see each

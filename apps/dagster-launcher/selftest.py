@@ -23,13 +23,21 @@ beyond loopback. Each case is one of the launcher's promises:
   params identity        a retry with different params is not the same run
   config refusal         a target whose params or placeholders can't work
                          stops the launcher at startup
+  embedded values        integer params rendered inside a string (a JSON run
+                         tag, "500m"); a free-form string never can be
+  step timings           run and per-attempt step times as UTC instants
+  usage                  every attempt's pods are found by name, deleted ones
+                         included; an attempt with no samples reads unmeasured
 """
 
+import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,6 +51,16 @@ class FakeDagster:
         self.launches = []
         self.deployment = None
         self.pods = []
+        self.metrics = {}  # pod -> container -> {samples, first, last, ws, hw, cpu, cores}
+
+    def metric_query(self, query):
+        pods = re.search(r'pod=~"([^"]*)"', query).group(1)
+        field = ("samples" if "count_over_time" in query else "first" if "tfirst" in query else
+                 "last" if "tlast" in query else "hw" if "max_usage" in query else
+                 "cores" if "rate(" in query else "cpu" if "cpu_usage" in query else "ws")
+        return [{"metric": {"pod": pod, "container": c}, "value": [0, str(v[field])]}
+                for pod, cs in self.metrics.items() if re.fullmatch(pods, pod)
+                for c, v in cs.items() if field in v]
 
     def deploy(self, digest, rolled_out=True):
         image = "registry.example/app@" + digest
@@ -89,8 +107,14 @@ def main():
             pass
 
         def do_POST(self):
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            data = json.dumps({"data": fake.handle(body["query"], body["variables"])}).encode()
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            if self.path == "/api/v1/query":
+                q = urllib.parse.parse_qs(raw.decode())["query"][0]
+                data = json.dumps({"status": "success", "data": {"resultType": "vector",
+                                                                  "result": fake.metric_query(q)}}).encode()
+            else:
+                body = json.loads(raw)
+                data = json.dumps({"data": fake.handle(body["query"], body["variables"])}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -124,7 +148,16 @@ def main():
         "writer_checks": [{"namespace": "ns", "label_selector": "role=writer"},
                           {"namespace": "ns", "service_account": "runner-release"}],
         "image_checks": [{"namespace": "ns", "deployment": "code", "digest": "app", "env": ["CURRENT_IMAGE"]}],
+        "usage": {"metrics_url": gql, "namespace": "ns", "scrape_interval_seconds": 30},
         "targets": {
+            "sized": {
+                "job": "sized_job",
+                "run_config": {"limits": {"memory": "${mem}", "cpu": "${cpu}m"}},
+                "params": {"mem": {"type": "integer", "min": 1, "max": 64, "required": True},
+                           "cpu": {"type": "integer", "min": 100, "max": 8000, "required": True}},
+                "tags": {"dagster-k8s/config": '{"container_config": {"resources": {"limits": '
+                                               '{"memory": ${mem}, "cpu": "${cpu}m"}}}}'},
+            },
             "slice": {
                 "job": "slice_job",
                 "run_config": {"ops": {"build": {"config": {"scope": "${scope}", "limit": "${limit}"}}}},
@@ -329,6 +362,72 @@ def main():
         "f": {"type": "array", "default": ["x"], "items": {"type": "string", "enum": ["y"]}}}})
     refused("config refusal: array without item type", {"job": "j", "params": {"f": {"type": "array"}}})
     refused("config refusal: unknown param type", {"job": "j", "params": {"f": {"type": "object"}}})
+
+    refused("config refusal: free-form string embedded in a tag",
+            {"job": "j", "params": {"s": {"type": "string"}}, "tags": {"t": '{"a": "${s}"}'}})
+    refused("config refusal: free-form string embedded in run config",
+            {"job": "j", "params": {"s": {"type": "string"}}, "run_config": {"x": "pre-${s}"}})
+
+    fake.runs[rid3]["status"] = "SUCCESS"
+    sized = {"target": "sized", "candidate": {"sha": sha2, "digests": dig}, "params": {"mem": 4, "cpu": 500}}
+    s, b = call("POST", "/launch", sized)
+    check("embedded values: launch", s == 201, (s, b))
+    rid4 = b.get("run_id")
+    p = fake.launches[-1]
+    tags = {t["key"]: t["value"] for t in p["executionMetadata"]["tags"]}
+    check("embedded values: integer rendered inside a string",
+          p["runConfigData"] == {"limits": {"memory": 4, "cpu": "500m"}}, p["runConfigData"])
+    check("embedded values: JSON run tag stays valid JSON",
+          json.loads(tags["dagster-k8s/config"]) == {"container_config": {"resources": {"limits": {"memory": 4, "cpu": "500m"}}}},
+          tags.get("dagster-k8s/config"))
+
+    fake.runs[rid4].update(status="FAILURE", startTime=1000.0, endTime=1100.0, stepStats=[
+        {"stepKey": "build", "status": "FAILURE", "startTime": 1000.5, "endTime": 1060.0,
+         "attempts": [{"startTime": 1000.5, "endTime": 1010.0}, {"startTime": 1020.0, "endTime": 1060.0}]}])
+    s, b = call("GET", f"/runs/{rid4}")
+    check("step timings: run instants in UTC",
+          b.get("started_at") == "1970-01-01T00:16:40.000Z" and b.get("completed_at") == "1970-01-01T00:18:20.000Z", b)
+    st = (b.get("step_timings") or {}).get("build", {})
+    check("step timings: every attempt, failures included",
+          st.get("status") == "FAILURE" and len(st.get("attempts", [])) == 2
+          and st["attempts"][1]["started_at"] == "1970-01-01T00:17:00.000Z", st)
+
+    step = "dagster-step-" + hashlib.md5((rid4 + "build").encode()).hexdigest()
+    fake.metrics = {
+        f"dagster-run-{rid4}-abcde": {"dagster": {"samples": 4, "first": 1005, "last": 1095, "ws": 100, "hw": 150,
+                                                  "cpu": 5.0, "cores": 0.5}},
+        f"{step}-xyz12": {"dagster": {"samples": 1, "first": 1005, "last": 1005, "ws": 200, "hw": 260, "cpu": 1.0,
+                                      "cores": 0.2}},
+        # an attempt that never happened, and another run's worker: neither may be counted
+        f"{step}-2-zzzzz": {"dagster": {"samples": 9, "first": 0, "last": 1, "ws": 9, "hw": 9, "cpu": 9, "cores": 9}},
+        f"dagster-run-{rid3}-qqqqq": {"dagster": {"samples": 9, "first": 0, "last": 1, "ws": 9, "hw": 9, "cpu": 9,
+                                                  "cores": 9}},
+    }
+    s, b = call("GET", f"/runs/{rid4}/usage")
+    att = b.get("attempts", [])
+    check("usage: states sampling interval and limits", s == 200 and b.get("sampling_interval_seconds") == 30
+          and any("OBSERVED" in n for n in b.get("notes", [])), b)
+    check("usage: run worker and every step attempt", [(a["kind"], a["attempt"]) for a in att]
+          == [("run_worker", None), ("step", 1), ("step", 2)], att)
+    w = att[0] if att else {}
+    check("usage: only this run's pods", [p["pod"] for p in w.get("pods", [])] == [f"dagster-run-{rid4}-abcde"]
+          and w.get("coverage") == 1.0, w)
+    a1 = att[1] if len(att) > 1 else {}
+    c1 = a1.get("pods", [{}])[0].get("containers", {}).get("dagster", {})
+    check("usage: high-water mark and observed maximum reported separately",
+          a1.get("measured") and c1.get("memory_high_water_bytes") == 260
+          and c1.get("memory_working_set_max_observed_bytes") == 200, a1)
+    a2 = att[2] if len(att) > 2 else {}
+    check("usage: an attempt with no samples is unmeasured, not zero",
+          a2.get("measured") is False and a2.get("pods") == [] and a2.get("coverage") is None, a2)
+    s, b = call("GET", f"/runs/{foreign}/usage")
+    check("usage: foreign run refused", s == 404, (s, b))
+    l2 = launcher.Launcher({**config, "usage": None}, ["k"], gql + "/graphql")
+    try:
+        l2.usage(rid4)
+        check("usage: refused when not configured", False, "answered")
+    except launcher.HTTPError as e:
+        check("usage: refused when not configured", e.status == 404, e.body)
 
     print(f"\n{len(failures)} failed" if failures else "\nall checks passed")
     sys.exit(1 if failures else 0)

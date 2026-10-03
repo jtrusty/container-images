@@ -4,7 +4,11 @@ Callers never talk to Dagster. They can only:
 
   POST /launch        start one of a fixed set of targets, in a fixed code
                       location, with parameters validated against a schema
-  GET  /runs/{id}     read the status of a run this launcher started
+  GET  /runs/{id}     read the status and step timings of a run this
+                      launcher started
+  GET  /runs/{id}/usage
+                      per-attempt memory and CPU observed for that run's
+                      pods, from cAdvisor metrics (when "usage" is configured)
   GET  /active        list this launcher's runs that are not finished yet
   GET  /healthz       liveness
 
@@ -35,6 +39,7 @@ import re
 import ssl
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,6 +58,24 @@ RELEASE_RE = re.compile(r"^[A-Za-z0-9._-]{1,63}$")
 # candidate.digests.<name>) so the caller cannot choose it separately.
 PLACEHOLDER_RE = re.compile(r"\$\{(candidate\.(?:sha|release|digests\.[a-z][a-z0-9-]{0,30})|[a-z_][a-z0-9_]*)\}")
 SCALAR_TYPES = {"string": str, "integer": int, "boolean": bool}
+# The same references inside a longer string ("${cpu}m", or a JSON tag value)
+# are replaced with their text. Only values whose text can't break out of the
+# surrounding string are allowed there: integer and boolean params and the
+# validated candidate fields. A free-form string param never is.
+EMBEDDED_RE = re.compile(r"\$\{(candidate\.(?:sha|release|digests\.[a-z][a-z0-9-]{0,30})|[a-z_][a-z0-9_]*)\}")
+EMBEDDABLE_TYPES = ("integer", "boolean")
+
+
+def iso(ts):
+    """Epoch seconds to a UTC ISO-8601 instant, or None."""
+    if ts is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts)) + f".{int((ts % 1) * 1000):03d}Z"
+
+
+def text(v):
+    """A typed value's text for embedding: JSON spelling for booleans."""
+    return json.dumps(v) if isinstance(v, bool) else str(v)
 
 
 def params_digest(params):
@@ -83,7 +106,8 @@ RUN = """
 query Run($id: ID!) {
   runOrError(runId: $id) {
     __typename
-    ... on Run { runId status startTime endTime tags { key value } }
+    ... on Run { runId status startTime endTime tags { key value }
+                 stepStats { stepKey status startTime endTime attempts { startTime endTime } } }
     ... on Error { message }
   }
 }"""
@@ -133,6 +157,18 @@ class Launcher:
                 except HTTPError as e:
                     raise SystemExit(f"target {name!r} param {pname!r}: default is invalid: {e.body}")
 
+        def check_ref(where, ref, embedded):
+            if ref.startswith("candidate.digests."):
+                if ref.split(".", 2)[2] not in self.cfg.get("required_digests", []):
+                    raise SystemExit(f"target {name!r}: {where} names a digest not in required_digests")
+            elif ref.startswith("candidate."):
+                return
+            elif ref not in schema:
+                raise SystemExit(f"target {name!r}: {where} names an undeclared param")
+            elif embedded and schema[ref]["type"] not in EMBEDDABLE_TYPES:
+                raise SystemExit(f"target {name!r}: {where} embeds {ref!r}; only integer and boolean params "
+                                 "can appear inside a longer string")
+
         def walk(v):
             if isinstance(v, dict):
                 for x in v.values():
@@ -140,14 +176,19 @@ class Launcher:
             elif isinstance(v, list):
                 for x in v:
                     walk(x)
-            elif isinstance(v, str) and (m := PLACEHOLDER_RE.fullmatch(v)):
-                ref = m.group(1)
-                if ref.startswith("candidate.digests."):
-                    if ref.split(".", 2)[2] not in self.cfg.get("required_digests", []):
-                        raise SystemExit(f"target {name!r}: {v} names a digest not in required_digests")
-                elif not ref.startswith("candidate.") and ref not in schema:
-                    raise SystemExit(f"target {name!r}: {v} names an undeclared param")
+            elif isinstance(v, str):
+                if m := PLACEHOLDER_RE.fullmatch(v):
+                    check_ref(v, m.group(1), embedded=False)
+                else:
+                    for m in EMBEDDED_RE.finditer(v):
+                        check_ref(v, m.group(1), embedded=True)
         walk(target.get("run_config", {}))
+        # Tag values are always strings, so every reference in them is embedded.
+        for k, v in target.get("tags", {}).items():
+            for m in EMBEDDED_RE.finditer(v):
+                check_ref(f"tag {k}", m.group(1), embedded=True)
+        if self.cfg.get("usage") and not self.cfg["usage"].get("metrics_url"):
+            raise SystemExit("usage needs metrics_url")
 
     # --- Kubernetes --------------------------------------------------------
     def kube_get(self, path):
@@ -256,6 +297,7 @@ class Launcher:
         for k in ("startTime", "endTime"):
             if k in run:
                 out[k] = run[k]
+        out["started_at"], out["completed_at"] = iso(run.get("startTime")), iso(run.get("endTime"))
         return out
 
     # --- validation --------------------------------------------------------
@@ -326,8 +368,17 @@ class Launcher:
         if t == "integer" and not (spec.get("min", v) <= v <= spec.get("max", v)):
             raise HTTPError(400, {"error": "param out of range", "param": name})
 
+    @staticmethod
+    def resolve(ref, params, candidate):
+        if ref.startswith("candidate.digests."):
+            return candidate["digests"].get(ref.split(".", 2)[2])
+        if ref.startswith("candidate."):
+            return candidate.get(ref.split(".", 1)[1])
+        return params.get(ref, None)
+
     def render(self, template, params, candidate):
-        """Substitute whole-string "${...}" placeholders with typed values."""
+        """Substitute "${...}" placeholders: a whole-string placeholder takes the
+        typed value, one inside a longer string is replaced with its text."""
         if isinstance(template, dict):
             return {k: self.render(v, params, candidate) for k, v in template.items()}
         if isinstance(template, list):
@@ -335,12 +386,8 @@ class Launcher:
         if isinstance(template, str):
             m = PLACEHOLDER_RE.fullmatch(template)
             if m:
-                ref = m.group(1)
-                if ref.startswith("candidate.digests."):
-                    return candidate["digests"].get(ref.split(".", 2)[2])
-                if ref.startswith("candidate."):
-                    return candidate.get(ref.split(".", 1)[1])
-                return params.get(ref, None)
+                return self.resolve(m.group(1), params, candidate)
+            return EMBEDDED_RE.sub(lambda m: text(self.resolve(m.group(1), params, candidate)), template)
         return template
 
     # --- operations --------------------------------------------------------
@@ -370,7 +417,8 @@ class Launcher:
             if release:
                 tags.append({"key": p + "release", "value": release})
             tags += [{"key": p + "digest-" + k, "value": v} for k, v in sorted(digests.items())]
-            tags += [{"key": k, "value": v} for k, v in sorted(target.get("tags", {}).items())]
+            cand = {"sha": sha, "release": release, "digests": digests}
+            tags += [{"key": k, "value": self.render(v, params, cand)} for k, v in sorted(target.get("tags", {}).items())]
             selector = {
                 "repositoryLocationName": self.cfg["location"],
                 "repositoryName": self.cfg.get("repository", "__repository__"),
@@ -380,8 +428,7 @@ class Launcher:
                 selector["assetSelection"] = [{"path": k.split("/")} for k in target["asset_selection"]]
             execution = {
                 "selector": selector,
-                "runConfigData": self.render(target.get("run_config", {}), params,
-                                             {"sha": sha, "release": release, "digests": digests}),
+                "runConfigData": self.render(target.get("run_config", {}), params, cand),
                 "executionMetadata": {"tags": tags},
             }
             d = self.gql(LAUNCH, {"p": execution})["launchRun"]
@@ -389,7 +436,7 @@ class Launcher:
                 return 502, {"error": "launch refused by dagster", "type": d["__typename"], "detail": d.get("message")}
             return 201, {"reused": False, "run_id": d["run"]["runId"], "status": d["run"]["status"]}
 
-    def run(self, run_id):
+    def own_run(self, run_id):
         if not RUN_ID_RE.match(run_id):
             raise HTTPError(404, {"error": "not found"})
         d = self.gql(RUN, {"id": run_id})["runOrError"]
@@ -399,7 +446,123 @@ class Launcher:
         # Runs this launcher didn't start look exactly like runs that don't exist.
         if tags.get(f"{self.prefix}/owner") != self.owner:
             raise HTTPError(404, {"error": "not found"})
-        return 200, self.summary(d)
+        return d
+
+    def run(self, run_id):
+        d = self.own_run(run_id)
+        out = self.summary(d)
+        # Only what Dagster recorded; a missing time stays null, never guessed.
+        out["step_timings"] = {
+            s["stepKey"]: {
+                "status": s.get("status"),
+                "started_at": iso(s.get("startTime")),
+                "completed_at": iso(s.get("endTime")),
+                "attempts": [{"started_at": iso(a.get("startTime")), "completed_at": iso(a.get("endTime"))}
+                             for a in s.get("attempts") or []],
+            }
+            for s in d.get("stepStats") or []
+        }
+        return 200, out
+
+    # --- usage -------------------------------------------------------------
+    def attempt_pods(self, d):
+        """Every pod a run's attempts could have used, by the names the Dagster
+        Kubernetes run launcher and step executor give them: the run worker
+        (and resumed workers), and one Job per step attempt. Names, not labels,
+        so pods that are already deleted are still found in the metrics."""
+        rid = d["runId"]
+        out = [{"kind": "run_worker", "step_key": None, "attempt": None,
+                "started_at": d.get("startTime"), "completed_at": d.get("endTime"),
+                "pod_re": rf"dagster-run-{rid}(-[0-9]+)?-[a-z0-9]{{5}}"}]
+        for s in d.get("stepStats") or []:
+            attempts = s.get("attempts") or [{"startTime": s.get("startTime"), "endTime": s.get("endTime")}]
+            base = "dagster-step-" + hashlib.md5((rid + s["stepKey"]).encode()).hexdigest()
+            for i, a in enumerate(attempts):
+                job = base if i == 0 else f"{base}-{i}"
+                out.append({"kind": "step", "step_key": s["stepKey"], "attempt": i + 1,
+                            "started_at": a.get("startTime"), "completed_at": a.get("endTime"),
+                            "pod_re": rf"{job}-[a-z0-9]{{5}}"})
+        return out
+
+    def metrics(self, query, at):
+        url = self.cfg["usage"]["metrics_url"].rstrip("/") + "/api/v1/query"
+        data = urllib.parse.urlencode({"query": query, "time": f"{at:.3f}"}).encode()
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, data=data, method="POST"), timeout=30) as r:
+                body = json.loads(r.read())
+        except (urllib.error.URLError, TimeoutError, ValueError) as e:
+            raise HTTPError(502, {"error": "metrics unavailable", "detail": str(e)[:200]})
+        if body.get("status") != "success":
+            raise HTTPError(502, {"error": "metrics error", "detail": str(body.get("error"))[:200]})
+        return {(r["metric"].get("pod"), r["metric"].get("container")): float(r["value"][1])
+                for r in body["data"]["result"]}
+
+    def usage(self, run_id):
+        u = self.cfg.get("usage")
+        if not u:
+            raise HTTPError(404, {"error": "usage is not configured"})
+        d = self.own_run(run_id)
+        attempts = self.attempt_pods(d)
+        step = int(u.get("scrape_interval_seconds", 30))
+        now = time.time()
+        start = (d.get("startTime") or now - 3600) - 2 * step
+        end = min(now, (d.get("endTime") or now) + 2 * step)
+        rng = f"{max(int(end - start), step)}s"
+        sel = '{namespace="%s",container!="",container!="POD",pod=~"%s"}' % (
+            u.get("namespace", "default"), "|".join(a["pod_re"] for a in attempts))
+        ws, cpu = "container_memory_working_set_bytes" + sel, "container_cpu_usage_seconds_total" + sel
+        q = {
+            "samples": f"sum by (pod, container) (count_over_time({ws}[{rng}]))",
+            "first_sample": f"min by (pod, container) (tfirst_over_time({ws}[{rng}]))",
+            "last_sample": f"max by (pod, container) (tlast_over_time({ws}[{rng}]))",
+            "memory_working_set_max_observed_bytes": f"max by (pod, container) (max_over_time({ws}[{rng}]))",
+            "memory_high_water_bytes": f"max by (pod, container) (max_over_time(container_memory_max_usage_bytes{sel}[{rng}]))",
+            # cumulative per container instance; a restarted container is a new series, so sum them
+            "cpu_seconds_observed": f"sum by (pod, container) (max_over_time({cpu}[{rng}]))",
+            "cpu_cores_max_observed": f"max by (pod, container) (max_over_time(rate({cpu}[{max(2 * step, 60)}s])[{rng}:{step}s]))",
+        }
+        res = {k: self.metrics(v, end) for k, v in q.items()}
+        pods = {}
+        for key in res["samples"]:
+            pods.setdefault(key[0], {})[key[1]] = {
+                k: (int(res[k][key]) if k in ("samples", "memory_working_set_max_observed_bytes",
+                                              "memory_high_water_bytes") else res[k][key])
+                if key in res[k] else None for k in q}
+        out = []
+        for a in attempts:
+            rx = re.compile(a["pod_re"])
+            matched = {p: c for p, c in pods.items() if rx.fullmatch(p)}
+            dur = (a["completed_at"] or end) - a["started_at"] if a["started_at"] else None
+            obs = [c for cs in matched.values() for c in cs.values()
+                   if c["samples"] and c["first_sample"] is not None and c["last_sample"] is not None]
+            observed = (max(c["last_sample"] for c in obs) - min(c["first_sample"] for c in obs) + step
+                        if obs else 0)
+            for c in (c for cs in matched.values() for c in cs.values()):
+                for k in ("first_sample", "last_sample"):
+                    c[k] = iso(c[k])
+            out.append({
+                "kind": a["kind"], "step_key": a["step_key"], "attempt": a["attempt"],
+                "started_at": iso(a["started_at"]), "completed_at": iso(a["completed_at"]),
+                "measured": bool(obs),
+                "observed_seconds": round(observed, 1) if obs else 0,
+                "coverage": round(min(1.0, observed / dur), 3) if obs and dur and dur > 0 else None,
+                "pods": [{"pod": p, "containers": cs} for p, cs in sorted(matched.items())],
+            })
+        return 200, {
+            "run_id": d["runId"], "status": d["status"], "terminal": d["status"] in TERMINAL,
+            "source": "cAdvisor container metrics via a Prometheus-compatible API (MetricsQL)",
+            "sampling_interval_seconds": step,
+            "window": {"start": iso(start), "end": iso(end)},
+            "notes": [
+                "Values are the maximum OBSERVED at the sampling interval: spikes shorter than the interval, "
+                "or a whole pod shorter than it, can be missed.",
+                "memory_high_water_bytes is the kernel's cgroup high-water mark (memory.peak) as of the "
+                "container's last sample; usage after that sample is not seen, so it is a lower bound.",
+                "An attempt with measured=false has no samples: treat it as unmeasured, never as zero.",
+                "coverage is observed sample span / attempt duration; null when the duration is unknown.",
+            ],
+            "attempts": out,
+        }
 
     def authorized(self, header):
         if not header or not header.startswith("Bearer "):
@@ -440,6 +603,8 @@ def make_handler(launcher):
                 return self.handle_request(lambda: (200, {"ok": True}))
             if self.path == "/active":
                 return self.handle_request(lambda: (200, {"active": launcher.active_runs()}))
+            if self.path.startswith("/runs/") and self.path.endswith("/usage"):
+                return self.handle_request(lambda: launcher.usage(self.path[len("/runs/"):-len("/usage")]))
             if self.path.startswith("/runs/"):
                 return self.handle_request(lambda: launcher.run(self.path[len("/runs/"):]))
             self.handle_request(lambda: (404, {"error": "not found"}))
