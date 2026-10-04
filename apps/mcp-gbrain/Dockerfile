@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.26.0@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
+# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # gbrain (garrytan/gbrain), built from source at a pinned commit, served as
 # an MCP server over streamable HTTP by supergateway. The same image runs the
 # gbrain CLI (autopilot, doctor, dream, ...) by overriding the command.
