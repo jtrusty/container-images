@@ -30,7 +30,7 @@ ARG KUBECTL_VERSION=v1.37.1
 ARG KUBECTL_SHA256=65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8
 # Exact patch, so a rebuild can't silently change the interpreter.
 # renovate: datasource=python-version depName=python
-ARG PYTHON_VERSION=3.10.21
+ARG PYTHON_VERSION=3.10.22
 
 USER root
 
