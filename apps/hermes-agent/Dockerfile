@@ -16,7 +16,7 @@ FROM docker.io/nousresearch/hermes-agent:${VERSION}@${DIGEST}
 LABEL org.opencontainers.image.description="hermes-agent with the GitHub CLI and tirith preinstalled"
 
 # renovate: datasource=github-releases depName=cli/cli
-ARG GH_VERSION=2.101.0
+ARG GH_VERSION=2.102.0
 ARG GH_SHA256=9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8
 # renovate: datasource=github-releases depName=sheeki03/tirith
 ARG TIRITH_VERSION=0.4.2
