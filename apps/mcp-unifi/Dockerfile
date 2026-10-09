@@ -11,7 +11,7 @@ ARG DIGEST=41a141afb914f7eac2e58c5d56a845db8fa18918
 
 FROM ghcr.io/astral-sh/uv:0.12.17@sha256:10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc AS uv
 
-FROM docker.io/library/python:3.14.8-slim@sha256:89fb7d3da20043c370643435258bdd7ab755d326d359001d02988ed15ae5219e AS build
+FROM docker.io/library/python:3.14.8-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS build
 ARG VERSION
 ARG DIGEST
 COPY --from=uv /uv /usr/local/bin/uv
@@ -33,7 +33,7 @@ RUN v="${VERSION##*/}" \
  && SETUPTOOLS_SCM_PRETEND_VERSION="${v#v}" \
     uv sync --frozen --no-dev --no-editable --package unifi-network-mcp
 
-FROM docker.io/library/python:3.14.8-slim@sha256:89fb7d3da20043c370643435258bdd7ab755d326d359001d02988ed15ae5219e
+FROM docker.io/library/python:3.14.8-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
 LABEL org.opencontainers.image.description="UniFi Network MCP server, built from source"
 WORKDIR /app
 COPY --from=build /app/.venv /app/.venv
