@@ -6,8 +6,8 @@
 # Upstream tags are per app (network/vX.Y.Z); the image tag is X.Y.Z.
 
 # renovate: datasource=github-tags depName=sirkirby/unifi-network-mcp versioning=regex:^network/v(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)$
-ARG VERSION=network/v0.32.10
-ARG DIGEST=41a141afb914f7eac2e58c5d56a845db8fa18918
+ARG VERSION=network/v0.39.3
+ARG DIGEST=e12c5bdaf073c33a4939b3d0dbf0fb879edeb7d5
 
 FROM ghcr.io/astral-sh/uv:0.12.17@sha256:10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc AS uv
 
