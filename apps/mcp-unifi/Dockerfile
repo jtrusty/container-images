@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+# syntax=docker/dockerfile:1.29.0@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183
 # unifi-network-mcp: the network server from sirkirby's unifi-mcp monorepo,
 # built from source at the release tag's commit. Mirrors upstream's
 # apps/network/Dockerfile (same Python, workdir, port, command and workspace
